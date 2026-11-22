@@ -1,0 +1,34 @@
+{
+  "id": "legado-booksource",
+  "name": "Legado 书源引擎",
+  "version": "0.2.0",
+  "apiVersion": 1,
+  "runtime": "node",
+  "entry": "src/index.js",
+  "permissions": {
+    "storage": true,
+    "network": true
+  },
+  "extensions": {
+    "pages": [
+      {
+        "id": "manage",
+        "title": "Legado 书源管理"
+      }
+    ]
+  },
+  "sourceTypes": [
+    {
+      "id": "legado",
+      "label": "Legado JSON 书源",
+      "capabilities": [
+        "search",
+        "detail",
+        "acquire.chapters",
+        "content.manifest",
+        "content.resource",
+        "content.update"
+      ]
+    }
+  ]
+}

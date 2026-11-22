@@ -1,0 +1,21 @@
+{
+  "name": "reader-plugin-legado",
+  "version": "0.2.0",
+  "description": "Legado (.json) book source engine plugin for hectorqin/reader-pro",
+  "type": "module",
+  "main": "src/index.js",
+  "files": [
+    "plugin.json",
+    "src/"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@xmldom/xmldom": "^0.9.6",
+    "cheerio": "^1.0.0",
+    "iconv-lite": "^0.6.3",
+    "jsonpath-plus": "^10.3.0",
+    "xpath": "^0.0.34"
+  }
+}
