@@ -1,80 +1,392 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 
-const bookMetaCache = new Map();
-const MAX_CACHE = 5000;
-
-export function cacheBookMeta(ref, meta) {
-  if (bookMetaCache.size >= MAX_CACHE) {
-    const firstKey = bookMetaCache.keys().next().value;
-    if (firstKey) bookMetaCache.delete(firstKey);
+// ---------------------------------------------------------------------------
+// Small persistence helpers
+// ---------------------------------------------------------------------------
+async function readJson(file, fallback) {
+  try {
+    return JSON.parse(await readFile(file, 'utf8'));
+  } catch {
+    return fallback;
   }
-  bookMetaCache.set(ref, meta);
 }
 
-export function getCachedBookMeta(ref) {
-  return bookMetaCache.get(ref) || null;
+async function writeJsonAtomic(file, data, pretty = false) {
+  await mkdir(dirname(file), { recursive: true });
+  const tmp = `${file}.tmp`;
+  await writeFile(tmp, pretty ? JSON.stringify(data, null, 2) : JSON.stringify(data), 'utf8');
+  await rename(tmp, file);
 }
 
+/** Debounced background writer; `flush()` writes immediately. */
+function createDebouncedWriter(getFile, getData, delayMs) {
+  let timer = null;
+  let running = false;
+  let again = false;
+  const run = async () => {
+    const file = getFile();
+    if (!file) return;
+    if (running) {
+      again = true;
+      return;
+    }
+    running = true;
+    try {
+      await writeJsonAtomic(file, getData());
+    } catch {
+      // best effort
+    } finally {
+      running = false;
+      if (again) {
+        again = false;
+        schedule();
+      }
+    }
+  };
+  const schedule = () => {
+    if (!getFile() || timer) return;
+    timer = setTimeout(() => {
+      timer = null;
+      void run();
+    }, delayMs);
+    timer.unref?.();
+  };
+  const flush = async () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    await run();
+  };
+  return { schedule, flush };
+}
+
+// ---------------------------------------------------------------------------
+// Book sources
+// ---------------------------------------------------------------------------
 function storageFile(dataDir) {
   return join(dataDir, 'legado-sources.json');
 }
 
+let sourcesCache = { dataDir: '', list: null };
+let sourcesLock = Promise.resolve();
+
+/** Serialize read-modify-write operations on the source list. */
+function withSourcesLock(fn) {
+  const next = sourcesLock.then(fn, fn);
+  sourcesLock = next.catch(() => {});
+  return next;
+}
+
 export async function loadSources(dataDir) {
   if (!dataDir) return [];
-  try {
-    const raw = await readFile(storageFile(dataDir), 'utf8');
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
+  if (sourcesCache.dataDir === dataDir && sourcesCache.list) return sourcesCache.list;
+  const parsed = await readJson(storageFile(dataDir), []);
+  const list = Array.isArray(parsed) ? parsed.filter((s) => s && typeof s === 'object' && s.bookSourceUrl) : [];
+  sourcesCache = { dataDir, list };
+  return list;
 }
 
 export async function saveSources(dataDir, sources) {
   if (!dataDir) throw new Error('Plugin storage directory is not configured');
-  await mkdir(dataDir, { recursive: true });
-  await writeFile(storageFile(dataDir), JSON.stringify(sources, null, 2), 'utf8');
+  await writeJsonAtomic(storageFile(dataDir), sources, true);
+  sourcesCache = { dataDir, list: sources };
 }
 
-export async function mergeSources(dataDir, incoming, { skipPaid = true } = {}) {
-  const existing = await loadSources(dataDir);
-  const byUrl = new Map();
-  for (const s of existing) {
-    if (s && s.bookSourceUrl) byUrl.set(s.bookSourceUrl, s);
+export function isSupportedSourceType(item, { allowComic = false } = {}) {
+  const t = item?.bookSourceType;
+  if (t === undefined || t === null || t === 0 || t === '0') return true;
+  if (allowComic && (t === 2 || t === '2')) return true;
+  return false;
+}
+
+export function mergeSources(dataDir, incoming, { skipPaid = true, allowComic = false } = {}) {
+  return withSourcesLock(async () => {
+    const existing = await loadSources(dataDir);
+    const byUrl = new Map();
+    for (const s of existing) {
+      if (s && s.bookSourceUrl) byUrl.set(s.bookSourceUrl, s);
+    }
+
+    let added = 0;
+    let updated = 0;
+    let skipped = 0;
+
+    const list = Array.isArray(incoming) ? incoming : [incoming];
+    for (const item of list) {
+      if (!item || typeof item !== 'object' || !item.bookSourceUrl) {
+        skipped++;
+        continue;
+      }
+      const name = String(item.bookSourceName || '');
+      const group = String(item.bookSourceGroup || '');
+      if (skipPaid && (name.includes('💰') || group.includes('💰'))) {
+        skipped++;
+        continue;
+      }
+      // Text sources (0); comic sources (2) only when explicitly allowed. Audio (1) is unsupported.
+      if (!isSupportedSourceType(item, { allowComic })) {
+        skipped++;
+        continue;
+      }
+      const prev = byUrl.get(item.bookSourceUrl);
+      if (prev) {
+        // Keep the user's enable/disable choice when a source is re-imported.
+        const next = { ...item };
+        if (prev.enabled === false) next.enabled = false;
+        byUrl.set(item.bookSourceUrl, next);
+        updated++;
+      } else {
+        byUrl.set(item.bookSourceUrl, item);
+        added++;
+      }
+    }
+
+    const merged = [...byUrl.values()];
+    await saveSources(dataDir, merged);
+    return { total: merged.length, added, updated, skipped };
+  });
+}
+
+/** Enable/disable the given source URLs. Returns how many changed. */
+export function setSourcesEnabled(dataDir, urls, enabled) {
+  const wanted = new Set(urls);
+  return withSourcesLock(async () => {
+    const list = await loadSources(dataDir);
+    let changed = 0;
+    const next = list.map((s) => {
+      if (!wanted.has(s.bookSourceUrl)) return s;
+      const isEnabled = s.enabled !== false;
+      if (isEnabled === enabled) return s;
+      changed++;
+      return { ...s, enabled };
+    });
+    if (changed > 0) await saveSources(dataDir, next);
+    return changed;
+  });
+}
+
+/** Shallow-merge `patch` into one source. Returns true when it existed. */
+export function updateSource(dataDir, url, patch) {
+  return withSourcesLock(async () => {
+    const list = await loadSources(dataDir);
+    let found = false;
+    const next = list.map((s) => {
+      if (s.bookSourceUrl !== url) return s;
+      found = true;
+      return { ...s, ...patch };
+    });
+    if (found) await saveSources(dataDir, next);
+    return found;
+  });
+}
+
+/** Delete the given source URLs. Returns how many were removed. */
+export function deleteSources(dataDir, urls) {
+  const wanted = new Set(urls);
+
+  return withSourcesLock(async () => {
+    const list = await loadSources(dataDir);
+    const next = list.filter((s) => !wanted.has(s.bookSourceUrl));
+    const removed = list.length - next.length;
+    if (removed > 0) await saveSources(dataDir, next);
+    for (const url of urls) health.delete(url);
+    if (removed > 0) healthWriter.schedule();
+    return removed;
+  });
+}
+
+export function clearAllSources(dataDir) {
+  return withSourcesLock(async () => {
+    await saveSources(dataDir, []);
+    health.clear();
+    healthWriter.schedule();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Persistent LRU cache of search/detail metadata (ref -> meta)
+// ---------------------------------------------------------------------------
+const bookMetaCache = new Map();
+const MAX_CACHE = 5000;
+let metaFile = '';
+
+function compactMeta(meta) {
+  if (!meta || typeof meta !== 'object') return meta;
+  const out = { ...meta };
+  if (typeof out.intro === 'string' && out.intro.length > 1000) out.intro = out.intro.slice(0, 1000);
+  return out;
+}
+
+const metaWriter = createDebouncedWriter(
+  () => metaFile,
+  () => [...bookMetaCache.entries()],
+  3000,
+);
+
+export function cacheBookMeta(ref, meta) {
+  if (!ref) return;
+  bookMetaCache.delete(ref);
+  bookMetaCache.set(ref, compactMeta(meta));
+  while (bookMetaCache.size > MAX_CACHE) {
+    const firstKey = bookMetaCache.keys().next().value;
+    if (firstKey === undefined) break;
+    bookMetaCache.delete(firstKey);
   }
+  metaWriter.schedule();
+}
 
-  let added = 0;
-  let updated = 0;
-  let skipped = 0;
+export function getCachedBookMeta(ref) {
+  const meta = bookMetaCache.get(ref);
+  if (!meta) return null;
+  // Refresh recency (LRU); persisted on the next scheduled write.
+  bookMetaCache.delete(ref);
+  bookMetaCache.set(ref, meta);
+  return meta;
+}
 
-  const list = Array.isArray(incoming) ? incoming : [incoming];
-  for (const item of list) {
-    if (!item || typeof item !== 'object' || !item.bookSourceUrl) {
-      skipped++;
-      continue;
-    }
-    const name = String(item.bookSourceName || '');
-    const group = String(item.bookSourceGroup || '');
-    if (skipPaid && (name.includes('💰') || group.includes('💰'))) {
-      skipped++;
-      continue;
-    }
-    // Only keep text novel sources (bookSourceType === 0 or undefined)
-    if (item.bookSourceType !== undefined && item.bookSourceType !== 0) {
-      skipped++;
-      continue;
-    }
-    if (byUrl.has(item.bookSourceUrl)) {
-      byUrl.set(item.bookSourceUrl, item);
-      updated++;
-    } else {
-      byUrl.set(item.bookSourceUrl, item);
-      added++;
+// ---------------------------------------------------------------------------
+// Source health / circuit breaker
+// ---------------------------------------------------------------------------
+export const BREAKER_THRESHOLD = 3; // consecutive failures before a source is paused
+const BREAKER_BASE_MS = 10 * 60 * 1000; // first pause: 10 minutes
+const BREAKER_MAX_MS = 6 * 3600 * 1000; // longest pause: 6 hours
+
+const health = new Map(); // bookSourceUrl -> record
+let healthFile = '';
+
+const healthWriter = createDebouncedWriter(
+  () => healthFile,
+  () => Object.fromEntries(health.entries()),
+  3000,
+);
+
+function healthRecord(url) {
+  let rec = health.get(url);
+  if (!rec) {
+    rec = {
+      okCount: 0,
+      failCount: 0,
+      consecutiveFails: 0,
+      avgMs: 0,
+      lastOkAt: 0,
+      lastFailAt: 0,
+      lastError: '',
+      cooldownUntil: 0,
+    };
+    health.set(url, rec);
+  }
+  return rec;
+}
+
+/**
+ * Record the outcome of a live request against a source.
+ * ok=false with an error counts towards the breaker; "no results" is a success.
+ */
+export function recordSourceResult(url, { ok, ms = 0, error = '' }) {
+  if (!url) return;
+  const rec = healthRecord(url);
+  const now = Date.now();
+  if (ms > 0) rec.avgMs = rec.avgMs ? Math.round(rec.avgMs * 0.7 + ms * 0.3) : Math.round(ms);
+  if (ok) {
+    rec.okCount++;
+    rec.consecutiveFails = 0;
+    rec.cooldownUntil = 0;
+    rec.lastOkAt = now;
+  } else {
+    rec.failCount++;
+    rec.consecutiveFails++;
+    rec.lastFailAt = now;
+    rec.lastError = String(error || 'failed').slice(0, 200);
+    if (rec.consecutiveFails >= BREAKER_THRESHOLD) {
+      const factor = 2 ** Math.min(rec.consecutiveFails - BREAKER_THRESHOLD, 10);
+      rec.cooldownUntil = now + Math.min(BREAKER_BASE_MS * factor, BREAKER_MAX_MS);
     }
   }
+  healthWriter.schedule();
+}
 
-  const merged = [...byUrl.values()];
-  await saveSources(dataDir, merged);
-  return { total: merged.length, added, updated, skipped };
+/** Store the latest full-chain health check result for a source. */
+export function setCheckResult(url, check) {
+  if (!url) return;
+  healthRecord(url).check = { ...check, at: Date.now() };
+  healthWriter.schedule();
+}
+
+export function getHealth(url) {
+  return health.get(url) || null;
+}
+
+export function isCoolingDown(url, now = Date.now()) {
+  const rec = health.get(url);
+  return !!rec && rec.cooldownUntil > now;
+}
+
+/** Clear breaker state (all sources when urls is omitted). */
+export function resetBreakers(urls) {
+  const list = urls ? urls : [...health.keys()];
+  for (const url of list) {
+    const rec = health.get(url);
+    if (rec) {
+      rec.consecutiveFails = 0;
+      rec.cooldownUntil = 0;
+    }
+  }
+  healthWriter.schedule();
+}
+
+/**
+ * Order for searching: healthy sources first, then unknown ones, then sources
+ * with recent failures; within each group faster sources go first.
+ */
+export function rankSources(sources) {
+  const scored = sources.map((s, i) => {
+    const rec = health.get(s.bookSourceUrl);
+    let tier = 1; // unknown
+    if (rec) {
+      if (rec.consecutiveFails > 0) tier = 2;
+      else if (rec.okCount > 0) tier = 0;
+    }
+    const ms = rec?.avgMs || 4000;
+    return { s, i, tier, ms };
+  });
+  scored.sort((a, b) => a.tier - b.tier || a.ms - b.ms || a.i - b.i);
+  return scored.map((x) => x.s);
+}
+
+// ---------------------------------------------------------------------------
+// Initialisation / shutdown
+// ---------------------------------------------------------------------------
+let initPromise = null;
+let initDir = '';
+
+/** Load persisted caches for this plugin data directory (idempotent). */
+export function initStorage(dataDir) {
+  if (!dataDir) return Promise.resolve();
+  if (initPromise && initDir === dataDir) return initPromise;
+  initDir = dataDir;
+  metaFile = join(dataDir, 'book-meta-cache.json');
+  healthFile = join(dataDir, 'source-health.json');
+  initPromise = (async () => {
+    const metaEntries = await readJson(metaFile, []);
+    if (Array.isArray(metaEntries)) {
+      for (const pair of metaEntries.slice(-MAX_CACHE)) {
+        if (Array.isArray(pair) && typeof pair[0] === 'string' && !bookMetaCache.has(pair[0])) {
+          bookMetaCache.set(pair[0], pair[1]);
+        }
+      }
+    }
+    const healthObj = await readJson(healthFile, {});
+    if (healthObj && typeof healthObj === 'object') {
+      for (const [url, rec] of Object.entries(healthObj)) {
+        if (rec && typeof rec === 'object' && !health.has(url)) health.set(url, rec);
+      }
+    }
+  })();
+  return initPromise;
+}
+
+export async function flushStorage() {
+  await Promise.allSettled([metaWriter.flush(), healthWriter.flush()]);
 }

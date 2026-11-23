@@ -4,11 +4,28 @@ import * as cheerio from 'cheerio';
 import { JSONPath } from 'jsonpath-plus';
 import xpath from 'xpath';
 import { DOMParser } from '@xmldom/xmldom';
-import { resolveUrl, getCookieForUrl, encodeQueryParam } from './http.js';
+import iconv from 'iconv-lite';
+import { resolveUrl, getCookieForUrl, setCookieString, encodeQueryParam, DEFAULT_UA } from './http.js';
 import { syncFetchLegado } from './sync-fetch.js';
 
 function md5Hex(input) {
   return crypto.createHash('md5').update(String(input ?? ''), 'utf8').digest('hex');
+}
+
+/** Map Java digest / HMAC algorithm names (SHA-256, HmacSHA1 ...) to Node names. */
+function nodeHashName(name) {
+  const n = String(name || 'MD5').toLowerCase().replace(/^hmac/, '').replace(/-/g, '');
+  if (n === 'sha') return 'sha1';
+  return n;
+}
+
+function digestBuf(data, algorithm) {
+  return crypto.createHash(nodeHashName(algorithm)).update(String(data ?? ''), 'utf8').digest();
+}
+
+function hmacBuf(data, algorithm, key) {
+  const keyBuf = Buffer.isBuffer(key) ? key : Buffer.from(String(key ?? ''), 'utf8');
+  return crypto.createHmac(nodeHashName(algorithm), keyBuf).update(String(data ?? ''), 'utf8').digest();
 }
 
 function createSymmetricCrypto(transformation, key, iv) {
@@ -650,6 +667,103 @@ export class RuleContext {
       createSymmetricCrypto(transformation, key, iv) {
         return createSymmetricCrypto(transformation, key, iv);
       },
+      // --- Legado JsExtensions crypto helpers (subset) ---
+      aesDecodeToString(data, key, transformation, iv) {
+        try {
+          return createSymmetricCrypto(transformation || 'AES/CBC/PKCS5Padding', key, iv).decryptStr(data);
+        } catch {
+          return '';
+        }
+      },
+      aesBase64DecodeToString(data, key, transformation, iv) {
+        try {
+          const buf = Buffer.from(String(data ?? ''), 'base64');
+          return createSymmetricCrypto(transformation || 'AES/CBC/PKCS5Padding', key, iv).decryptStr(buf);
+        } catch {
+          return '';
+        }
+      },
+      aesEncodeToString(data, key, transformation, iv) {
+        return createSymmetricCrypto(transformation || 'AES/CBC/PKCS5Padding', key, iv).encryptHex(data);
+      },
+      aesEncodeToBase64String(data, key, transformation, iv) {
+        return createSymmetricCrypto(transformation || 'AES/CBC/PKCS5Padding', key, iv).encryptBase64(data);
+      },
+      desDecodeToString(data, key, transformation, iv) {
+        try {
+          return createSymmetricCrypto(transformation || 'DES/CBC/PKCS5Padding', key, iv).decryptStr(data);
+        } catch {
+          return '';
+        }
+      },
+      desBase64DecodeToString(data, key, transformation, iv) {
+        try {
+          const buf = Buffer.from(String(data ?? ''), 'base64');
+          return createSymmetricCrypto(transformation || 'DES/CBC/PKCS5Padding', key, iv).decryptStr(buf);
+        } catch {
+          return '';
+        }
+      },
+      desEncodeToBase64String(data, key, transformation, iv) {
+        return createSymmetricCrypto(transformation || 'DES/CBC/PKCS5Padding', key, iv).encryptBase64(data);
+      },
+      tripleDESDecodeStr(data, key, mode, padding, iv) {
+        try {
+          return createSymmetricCrypto(`DESede/${mode || 'CBC'}/${padding || 'PKCS5Padding'}`, key, iv).decryptStr(data);
+        } catch {
+          return '';
+        }
+      },
+      tripleDESEncodeBase64Str(data, key, mode, padding, iv) {
+        return createSymmetricCrypto(`DESede/${mode || 'CBC'}/${padding || 'PKCS5Padding'}`, key, iv).encryptBase64(data);
+      },
+      digestHex(data, algorithm) {
+        return digestBuf(data, algorithm).toString('hex');
+      },
+      digestBase64Str(data, algorithm) {
+        return digestBuf(data, algorithm).toString('base64');
+      },
+      HMacHex(data, algorithm, key) {
+        return hmacBuf(data, algorithm, key).toString('hex');
+      },
+      HMacBase64(data, algorithm, key) {
+        return hmacBuf(data, algorithm, key).toString('base64');
+      },
+      randomUUID() {
+        return crypto.randomUUID();
+      },
+      base64DecodeToByteArray(str) {
+        return [...Buffer.from(String(str ?? ''), 'base64')].map((b) => (b > 127 ? b - 256 : b));
+      },
+      strToBytes(str, charset = 'utf-8') {
+        const buf = iconv.encodingExists(charset) ? iconv.encode(String(str ?? ''), charset) : Buffer.from(String(str ?? ''));
+        return [...buf].map((b) => (b > 127 ? b - 256 : b));
+      },
+      bytesToStr(bytes, charset = 'utf-8') {
+        const buf = Buffer.from((Array.isArray(bytes) ? bytes : []).map((b) => (b < 0 ? b + 256 : b)));
+        return iconv.encodingExists(charset) ? iconv.decode(buf, charset) : buf.toString('utf8');
+      },
+      utf8ToGbk(str) {
+        return iconv.decode(iconv.encode(String(str ?? ''), 'gbk'), 'gbk');
+      },
+      htmlFormat(str) {
+        return htmlToCleanText(str);
+      },
+      getWebViewUA() {
+        return DEFAULT_UA;
+      },
+      ajaxAll(urls) {
+        const list = Array.isArray(urls) ? urls : [urls];
+        return list.map((u) => {
+          const res = syncFetchLegado(String(u), { baseUrl: self.baseUrl, sourceHeader: self.source.header });
+          return {
+            body: () => res.body,
+            url: () => res.url,
+            headers: () => res.headers,
+            code: () => res.status,
+          };
+        });
+      },
       getCookie(tag, key) {
         const all = getCookieForUrl(tag || self.baseUrl);
         if (!key) return all;
@@ -690,6 +804,8 @@ export class RuleContext {
       cookie: {
         getCookie: (url) => getCookieForUrl(url || this.baseUrl),
         getKey: (url, k) => java.getCookie(url, k),
+        setCookie: (url, value) => setCookieString(url || this.baseUrl, value),
+        replaceCookie: (url, value) => setCookieString(url || this.baseUrl, value),
       },
       String,
       Number,

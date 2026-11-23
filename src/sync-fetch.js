@@ -1,6 +1,7 @@
 import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { parseLegadoUrl, getCookieForUrl, setCookieForUrl } from './http.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 let worker = null;
@@ -18,10 +19,24 @@ function getWorker() {
 
 const MAX_BUF = 4 * 1024 * 1024; // 4 MiB max sync response
 
+/**
+ * Blocking HTTP for Legado scripts (java.ajax / java.get / java.post ...).
+ * The worker thread has its own copy of http.js, so the real (persistent)
+ * cookie jar of this thread is used here: the Cookie header is computed
+ * before the request and Set-Cookie headers are merged back afterwards.
+ */
 export function syncFetchLegado(rawUrl, options = {}) {
   const signalBuf = new SharedArrayBuffer(12);
   const ctrl = new Int32Array(signalBuf);
   const dataBuf = new SharedArrayBuffer(MAX_BUF);
+
+  let cookieHeader = '';
+  try {
+    const parsed = parseLegadoUrl(rawUrl, options.baseUrl || '', options.sourceHeader || '');
+    cookieHeader = getCookieForUrl(parsed.url);
+  } catch {
+    cookieHeader = '';
+  }
 
   const w = getWorker();
   w.postMessage({
@@ -31,6 +46,7 @@ export function syncFetchLegado(rawUrl, options = {}) {
     baseUrl: options.baseUrl || '',
     sourceHeader: options.sourceHeader || '',
     timeoutMs: options.timeoutMs || 10_000,
+    cookieHeader,
   });
 
   // Wait up to timeoutMs + 2000ms
@@ -45,9 +61,14 @@ export function syncFetchLegado(rawUrl, options = {}) {
   if (isError) {
     return { url: rawUrl, status: 0, headers: {}, body: '', error: text };
   }
+  let res;
   try {
-    return JSON.parse(text);
+    res = JSON.parse(text);
   } catch {
     return { url: rawUrl, status: 200, headers: {}, body: text };
   }
+  if (Array.isArray(res?.setCookies) && res.setCookies.length > 0) {
+    setCookieForUrl(res.url || rawUrl, res.setCookies);
+  }
+  return res;
 }
