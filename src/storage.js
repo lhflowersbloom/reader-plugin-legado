@@ -132,9 +132,10 @@ export function mergeSources(dataDir, incoming, { skipPaid = true, allowComic = 
       }
       const prev = byUrl.get(item.bookSourceUrl);
       if (prev) {
-        // Keep the user's enable/disable choice when a source is re-imported.
+        // Keep the user's enable/disable and rich-HTML mode choices when a source is re-imported.
         const next = { ...item };
         if (prev.enabled === false) next.enabled = false;
+        if (typeof prev.readerHtml === 'boolean') next.readerHtml = prev.readerHtml;
         byUrl.set(item.bookSourceUrl, next);
         updated++;
       } else {
@@ -247,11 +248,61 @@ export function getCachedBookMeta(ref) {
 }
 
 // ---------------------------------------------------------------------------
+// Plugin runtime settings (persisted in settings.json)
+// ---------------------------------------------------------------------------
+export const DEFAULT_SETTINGS = {
+  searchBatchSize: 15,
+  searchTimeoutMs: 7000,
+  breakerThreshold: 3,
+  breakerBaseMinutes: 10,
+  breakerMaxHours: 6,
+  autoCheckEnabled: false,
+  autoCheckHours: 24,
+  autoCheckKeyword: '凡人修仙传',
+  autoCheckDisableFailed: false,
+  lastAutoCheckAt: 0,
+};
+
+let settings = { ...DEFAULT_SETTINGS };
+let settingsFile = '';
+
+function clampInt(val, min, max, fallback) {
+  const n = Number.parseInt(String(val ?? ''), 10);
+  if (Number.isNaN(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function sanitizeSettings(raw = {}) {
+  return {
+    searchBatchSize: clampInt(raw.searchBatchSize, 5, 40, DEFAULT_SETTINGS.searchBatchSize),
+    searchTimeoutMs: clampInt(raw.searchTimeoutMs, 2000, 20000, DEFAULT_SETTINGS.searchTimeoutMs),
+    breakerThreshold: clampInt(raw.breakerThreshold, 1, 20, DEFAULT_SETTINGS.breakerThreshold),
+    breakerBaseMinutes: clampInt(raw.breakerBaseMinutes, 1, 1440, DEFAULT_SETTINGS.breakerBaseMinutes),
+    breakerMaxHours: clampInt(raw.breakerMaxHours, 1, 72, DEFAULT_SETTINGS.breakerMaxHours),
+    autoCheckEnabled: raw.autoCheckEnabled === true,
+    autoCheckHours: clampInt(raw.autoCheckHours, 1, 168, DEFAULT_SETTINGS.autoCheckHours),
+    autoCheckKeyword: String(raw.autoCheckKeyword || DEFAULT_SETTINGS.autoCheckKeyword).trim().slice(0, 50) || DEFAULT_SETTINGS.autoCheckKeyword,
+    autoCheckDisableFailed: raw.autoCheckDisableFailed === true,
+    lastAutoCheckAt: Number(raw.lastAutoCheckAt) || 0,
+  };
+}
+
+export function getSettings() {
+  return { ...settings };
+}
+
+export async function updateSettings(patch) {
+  settings = sanitizeSettings({ ...settings, ...(patch || {}) });
+  if (settingsFile) {
+    await writeJsonAtomic(settingsFile, settings, true);
+  }
+  return getSettings();
+}
+
+// ---------------------------------------------------------------------------
 // Source health / circuit breaker
 // ---------------------------------------------------------------------------
-export const BREAKER_THRESHOLD = 3; // consecutive failures before a source is paused
-const BREAKER_BASE_MS = 10 * 60 * 1000; // first pause: 10 minutes
-const BREAKER_MAX_MS = 6 * 3600 * 1000; // longest pause: 6 hours
+export const BREAKER_THRESHOLD = DEFAULT_SETTINGS.breakerThreshold;
 
 const health = new Map(); // bookSourceUrl -> record
 let healthFile = '';
@@ -288,6 +339,9 @@ export function recordSourceResult(url, { ok, ms = 0, error = '' }) {
   if (!url) return;
   const rec = healthRecord(url);
   const now = Date.now();
+  const threshold = settings.breakerThreshold || DEFAULT_SETTINGS.breakerThreshold;
+  const baseMs = (settings.breakerBaseMinutes || DEFAULT_SETTINGS.breakerBaseMinutes) * 60_000;
+  const maxMs = (settings.breakerMaxHours || DEFAULT_SETTINGS.breakerMaxHours) * 3600_000;
   if (ms > 0) rec.avgMs = rec.avgMs ? Math.round(rec.avgMs * 0.7 + ms * 0.3) : Math.round(ms);
   if (ok) {
     rec.okCount++;
@@ -299,9 +353,9 @@ export function recordSourceResult(url, { ok, ms = 0, error = '' }) {
     rec.consecutiveFails++;
     rec.lastFailAt = now;
     rec.lastError = String(error || 'failed').slice(0, 200);
-    if (rec.consecutiveFails >= BREAKER_THRESHOLD) {
-      const factor = 2 ** Math.min(rec.consecutiveFails - BREAKER_THRESHOLD, 10);
-      rec.cooldownUntil = now + Math.min(BREAKER_BASE_MS * factor, BREAKER_MAX_MS);
+    if (rec.consecutiveFails >= threshold) {
+      const factor = 2 ** Math.min(rec.consecutiveFails - threshold, 10);
+      rec.cooldownUntil = now + Math.min(baseMs * factor, maxMs);
     }
   }
   healthWriter.schedule();
@@ -368,7 +422,12 @@ export function initStorage(dataDir) {
   initDir = dataDir;
   metaFile = join(dataDir, 'book-meta-cache.json');
   healthFile = join(dataDir, 'source-health.json');
+  settingsFile = join(dataDir, 'settings.json');
   initPromise = (async () => {
+    const savedSettings = await readJson(settingsFile, null);
+    if (savedSettings && typeof savedSettings === 'object') {
+      settings = sanitizeSettings(savedSettings);
+    }
     const metaEntries = await readJson(metaFile, []);
     if (Array.isArray(metaEntries)) {
       for (const pair of metaEntries.slice(-MAX_CACHE)) {

@@ -236,24 +236,41 @@ export function setCookieString(urlStr, cookieStr) {
   setCookieForUrl(urlStr, parts);
 }
 
+/** Remove cookies matching a URL / host (used by cookie.removeCookie). */
+export function removeCookie(urlStr) {
+  const host = hostOf(urlStr);
+  if (!host) return;
+  let changed = cookieJar.delete(host);
+  for (const key of [...cookieJar.keys()]) {
+    if (!key.startsWith('.')) continue;
+    const d = key.slice(1);
+    if (host === d || host.endsWith(`.${d}`)) {
+      cookieJar.delete(key);
+      changed = true;
+    }
+  }
+  if (changed) scheduleCookieSave();
+}
+
 // ---------------------------------------------------------------------------
 // URL helpers
 // ---------------------------------------------------------------------------
 export function resolveUrl(baseUrl, target) {
   if (!target) return '';
   const trimmed = String(target).trim();
+  const cleanBase = String(baseUrl ?? '').trim();
   if (!trimmed) return '';
   if (/^https?:\/\//i.test(trimmed)) return trimmed;
   if (trimmed.startsWith('//')) {
     try {
-      const proto = new URL(baseUrl).protocol || 'https:';
+      const proto = new URL(cleanBase).protocol || 'https:';
       return `${proto}${trimmed}`;
     } catch {
       return `https:${trimmed}`;
     }
   }
   try {
-    return new URL(trimmed, baseUrl).href;
+    return new URL(trimmed, cleanBase).href;
   } catch {
     return trimmed;
   }
@@ -274,11 +291,12 @@ export function parseLegadoUrl(rawUrl, baseUrl = '', sourceHeader = '') {
     try {
       opts = JSON.parse(jsonPart);
     } catch {
-      // Relaxed JSON (single quotes or unquoted keys)
+      // Relaxed JSON (single quotes, smart quotes, or unquoted keys)
       try {
         const relaxed = jsonPart
+          .replace(/[“”]/g, '"')
           .replace(/'/g, '"')
-          .replace(/([{,]\s*)([a-zA-Z0-9_]+)\s*:/g, '$1"$2":');
+          .replace(/([{,]\s*)([a-zA-Z0-9_-]+)\s*:/g, '$1"$2":');
         opts = JSON.parse(relaxed);
       } catch {
         opts = {};

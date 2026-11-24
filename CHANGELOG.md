@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.0 (2026-11-24)
+
+### 新增
+- **管理页运行参数配置（`settings.json` 持久化）**：「维护与设置」页可配置每批并发查源数、单源搜索超时、连续失败触发熔断次数、首次/最长冷却时间，重启不丢失。
+- **宿主定时自动测活（`extensions.tasks`）**：接入 `reader-pro` 的定时任务协议（`extension.task`），可在管理页开启按小时间隔后台自动测活及可选自动禁用失败书源。
+- **模糊换源与进度排序（`content.alternatives`）**：支持自动剔除版本标签与副标题匹配，作者匹配时允许主书名前缀匹配并自动拦截续作后缀（如“2/第二部/仙界篇”等），按匹配度与最新章节号优先排序。
+- **轻量 Rhino `Packages.javax.crypto` / `JavaImporter` 兼容垫片**：基于 Node 原生 `crypto` 兼容 `Cipher`（AES/DES/3DES）、`SecretKeySpec`、`IvParameterSpec`、`MessageDigest`、`Base64`、`Arrays.copyOfRange` 与 `String.prototype.getBytes`。
+- **补充规则与脚本能力**：支持 `source.jsLib` 公共脚本库、`+@js:` 全量模式前缀、`{{...}}` 内嵌 `@css:` / `@XPath:` / `@Json:` 规则、`cookie.removeCookie` 及 `java.toNumChapter` 中文章节号转数字。
+
+### 修复
+- **修复 `@xmldom/xmldom` 0.9.x 下 XPath 规则全部静默返回空的问题**：改用新版 `onError` 构造参数，并在序列化 XML 前移除 `<script>` / `<style>` / `DOCTYPE` / 默认命名空间，避免脚本内 `<` / `&` 中断 XML 解析。
+- **修复 `@js:` / `<js>` 内嵌 `{{...}}` 与 `@get:{...}` 模板未预插值导致语法错误的问题**（修复七猫、淘小说等脚本签名拼接）。
+- **修复 `book.kind` / `book.wordCount` 未在搜索、详情、目录间传递的问题**（修复 `QQ浏览器[api]` 等依赖 `{{book.kind}}` 的接口书源）。
+- **修复 `text.xxx.0` 索引未拆解与匹配到 `<html>`/`<style>` 外层节点的问题**（优先匹配自身文本节点 `ownText`）。
+- **修复 HTTP 403 / Cloudflare 拦截被误判为“未搜到”（正常源）的问题**：搜索遇到 401/403/429/5xx 或 Cloudflare 拦截页均正常报错并纳入熔断统计；目录与正文对 `>= 400` 响应报错。
+- **修复图文模式 `<img src="url,{JSON}">` 属性引号截断问题**，支持 `<amp-img>`，并对规则显式输出 `<img src=...>` 的伪装文本源自动启用图文模式（实测漫客栈等漫画源图片拉取正常）。
+- **安装包补齐文档**：`package.json` 的 `files` 加入 `CHANGELOG.md` 与 `README.md`；修复 `sync-fetch` 工作线程继承 CLI `execArgv` 报错。
+
 ## 0.3.0 (2026-11-23)
 
 ### 新增

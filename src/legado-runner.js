@@ -33,7 +33,8 @@ export function sourceUsesHtml(source) {
   if (!source) return false;
   if (source.readerHtml === true) return true;
   if (source.readerHtml === false) return false;
-  return String(source.bookSourceType) === '2';
+  if (String(source.bookSourceType) === '2') return true;
+  return /['"`]<img\s+src=/i.test(String(source.ruleContent?.content || ''));
 }
 
 const IMAGE_URL_RE = /^(https?:)?\/\/\S+\.(jpe?g|png|gif|webp|bmp)(\?\S*)?(,\s*\{[\s\S]*\})?$/i;
@@ -82,11 +83,15 @@ function buildRichHtml(parts, source) {
 
   for (const { raw, baseUrl } of parts) {
     if (!raw) continue;
-    const text = String(raw);
+    // Pre-fix Legado scripts that emit <img src="https://...,{\"headers\":{...}}"> with unescaped quotes
+    const text = String(raw).replace(
+      /<img\s+[^>]*?src="([^"]*?,\s*\{[\s\S]*?\})"[^>]*?>/gi,
+      (_, u) => `<img src='${u.replace(/'/g, '"')}'>`,
+    );
     if (/<[a-z][\s\S]*>/i.test(text)) {
       const $ = cheerio.load(`<div id="__root">${text}</div>`);
       $('script,style,noscript,iframe').remove();
-      $('#__root img').each((_, el) => {
+      $('#__root img, #__root amp-img').each((_, el) => {
         const $el = $(el);
         const src =
           $el.attr('data-original') || $el.attr('data-src') || $el.attr('_src') || $el.attr('src') || '';
@@ -137,16 +142,35 @@ export async function fetchImageResource(source, imageUrl, referer, { timeoutMs 
   return { mediaType: type, base64: res.buffer.toString('base64') };
 }
 
+function assertLegadoResponse(res, stage = 'search') {
+  if (!res) throw new Error('Empty HTTP response');
+  const body = String(res.body || '');
+  if (
+    (res.status === 403 || res.status === 503) &&
+    /Attention Required! \| Cloudflare|<title>Just a moment\.\.\.<\/title>|cf-browser-verification/i.test(body.slice(0, 2048))
+  ) {
+    throw new Error(`HTTP ${res.status} (Cloudflare 防护拦截)`);
+  }
+  if (stage === 'search' || stage === 'explore') {
+    if (res.status === 401 || res.status === 403 || res.status === 429 || res.status >= 500) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+  } else if (res.status >= 400) {
+    throw new Error(`HTTP ${res.status}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Book lists (search + explore share the same parser)
 // ---------------------------------------------------------------------------
 function buildSearchUrl(source, query, page = 1) {
   const raw = String(source.searchUrl || '').trim();
   if (!raw) return '';
+  const baseUrl = String(source.bookSourceUrl || '').trim();
 
   const ctx = new RuleContext({
     source,
-    baseUrl: source.bookSourceUrl || '',
+    baseUrl,
     content: '',
     key: query,
     page,
@@ -157,7 +181,7 @@ function buildSearchUrl(source, query, page = 1) {
   }
 
   // Detect charset in trailing ,{...} option
-  const parsed = parseLegadoUrl(raw, source.bookSourceUrl || '', source.header || '');
+  const parsed = parseLegadoUrl(raw, baseUrl, source.header || '');
   const encodedKey = encodeQueryParam(query, parsed.charset);
 
   // Replace {{key}} and {{page}}
@@ -165,9 +189,10 @@ function buildSearchUrl(source, query, page = 1) {
 }
 
 function parseBookList(source, res, rule, { key = '', page = 1 } = {}) {
+  const baseUrl = res.url || String(source.bookSourceUrl || '').trim();
   const ctx = new RuleContext({
     source,
-    baseUrl: res.url || source.bookSourceUrl || '',
+    baseUrl,
     content: res.body,
     key,
     page,
@@ -185,12 +210,17 @@ function parseBookList(source, res, rule, { key = '', page = 1 } = {}) {
 
   for (const item of items) {
     const itemCtx = ctx.cloneWith({ content: item });
-    const title = itemCtx.getString(rule.name || 'text');
+    const rawTitle = itemCtx.getString(rule.name || 'text');
+    const title = htmlToCleanText(rawTitle).replace(/\s+/g, ' ').trim() || rawTitle.trim();
+    const author = itemCtx.getString(rule.author);
+    const kind = rule.kind ? itemCtx.getString(rule.kind) : '';
+    const wordCount = rule.wordCount ? itemCtx.getString(rule.wordCount) : '';
+    itemCtx.book = { ...itemCtx.book, name: title, author, kind, wordCount };
+
     const bookUrl = itemCtx.getString(rule.bookUrl || 'href', true) || itemCtx.getString('a@href', true);
-    if (!title || !bookUrl || seenUrls.has(bookUrl)) continue;
+    if (!title || !bookUrl || /^javascript:/i.test(bookUrl) || seenUrls.has(bookUrl)) continue;
     seenUrls.add(bookUrl);
 
-    const author = itemCtx.getString(rule.author);
     const intro = itemCtx.getString(rule.intro);
     const coverUrl = itemCtx.getString(rule.coverUrl, true);
     const lastChapter = itemCtx.getString(rule.lastChapter);
@@ -200,6 +230,8 @@ function parseBookList(source, res, rule, { key = '', page = 1 } = {}) {
       bookUrl,
       title,
       author,
+      kind,
+      wordCount,
       intro,
       coverUrl,
       lastChapter,
@@ -227,12 +259,12 @@ export async function searchWithSource(source, query, { page = 1, timeoutMs = 80
   if (!searchUrl) return [];
 
   const res = await fetchLegado(searchUrl, {
-    baseUrl: source.bookSourceUrl || '',
+    baseUrl: String(source.bookSourceUrl || '').trim(),
     sourceHeader: source.header || '',
     timeoutMs,
     signal,
   });
-  if (res.status >= 500) throw new Error(`HTTP ${res.status}`);
+  assertLegadoResponse(res, 'search');
 
   return parseBookList(source, res, source.ruleSearch || {}, { key: query, page });
 }
@@ -282,13 +314,13 @@ function parseExploreValue(value) {
 export function exploreCategories(source) {
   const raw = String(source.exploreUrl || '').trim();
   if (!raw) return [];
-  const ctx = new RuleContext({ source, baseUrl: source.bookSourceUrl || '', content: '' });
+  const ctx = new RuleContext({ source, baseUrl: String(source.bookSourceUrl || '').trim(), content: '' });
   let value = raw;
   try {
     if (raw.startsWith('@js:')) {
-      value = ctx.runJs(raw.slice(4), '');
+      value = ctx.runJs(ctx.prepareJsCode(raw.slice(4)), '');
     } else if (/^<js>[\s\S]*<\/js>$/i.test(raw)) {
-      value = ctx.runJs(raw.replace(/^<js>/i, '').replace(/<\/js>$/i, ''), '');
+      value = ctx.runJs(ctx.prepareJsCode(raw.replace(/^<js>/i, '').replace(/<\/js>$/i, '')), '');
     }
   } catch {
     value = '';
@@ -297,18 +329,19 @@ export function exploreCategories(source) {
 }
 
 export async function exploreWithSource(source, exploreUrl, { page = 1, timeoutMs = 10_000, signal } = {}) {
-  const ctx = new RuleContext({ source, baseUrl: source.bookSourceUrl || '', content: '', page });
+  const baseUrl = String(source.bookSourceUrl || '').trim();
+  const ctx = new RuleContext({ source, baseUrl, content: '', page });
   const raw = String(exploreUrl || '').trim();
   const url = raw.startsWith('@js:') || raw.includes('<js>') ? ctx.getString(raw) : ctx.interpolateTemplate(raw);
   if (!url) return [];
 
   const res = await fetchLegado(url, {
-    baseUrl: source.bookSourceUrl || '',
+    baseUrl,
     sourceHeader: source.header || '',
     timeoutMs,
     signal,
   });
-  if (res.status >= 500) throw new Error(`HTTP ${res.status}`);
+  assertLegadoResponse(res, 'explore');
 
   const exploreRule = source.ruleExplore || {};
   const rule = exploreRule.bookList ? exploreRule : source.ruleSearch || {};
@@ -321,9 +354,12 @@ export async function exploreWithSource(source, exploreUrl, { page = 1, timeoutM
 export async function fetchBookDetail(source, meta, { timeoutMs = 10_000, signal } = {}) {
   const bookUrl = meta.bookUrl;
   const infoRule = source.ruleBookInfo || {};
+  const srcBase = String(source.bookSourceUrl || '').trim();
 
   let title = meta.title || '未命名';
   let author = meta.author || '';
+  let kind = meta.kind || '';
+  let wordCount = meta.wordCount || '';
   let intro = meta.intro || '';
   let coverUrl = meta.coverUrl || '';
   let lastChapter = meta.lastChapter || '';
@@ -332,7 +368,7 @@ export async function fetchBookDetail(source, meta, { timeoutMs = 10_000, signal
   if (bookUrl && Object.keys(infoRule).length > 0) {
     try {
       const res = await fetchLegado(bookUrl, {
-        baseUrl: source.bookSourceUrl || '',
+        baseUrl: srcBase,
         sourceHeader: source.header || '',
         timeoutMs,
         signal,
@@ -343,7 +379,7 @@ export async function fetchBookDetail(source, meta, { timeoutMs = 10_000, signal
         baseUrl: res.url || bookUrl,
         content: res.body,
         vars: meta.vars || {},
-        book: { name: title, author, bookUrl },
+        book: { name: title, author, bookUrl, kind, wordCount },
       });
 
       if (infoRule.init) {
@@ -353,13 +389,19 @@ export async function fetchBookDetail(source, meta, { timeoutMs = 10_000, signal
 
       const nTitle = ctx.getString(infoRule.name);
       const nAuthor = ctx.getString(infoRule.author);
+      const nKind = infoRule.kind ? ctx.getString(infoRule.kind) : '';
+      const nWord = infoRule.wordCount ? ctx.getString(infoRule.wordCount) : '';
       const nIntro = ctx.getString(infoRule.intro);
       const nCover = ctx.getString(infoRule.coverUrl, true);
       const nLast = ctx.getString(infoRule.lastChapter);
-      const nToc = ctx.getString(infoRule.tocUrl, true);
 
-      if (nTitle) title = nTitle;
+      if (nTitle) title = htmlToCleanText(nTitle).replace(/\s+/g, ' ').trim() || nTitle;
       if (nAuthor) author = nAuthor;
+      if (nKind) kind = nKind;
+      if (nWord) wordCount = nWord;
+      ctx.book = { ...ctx.book, name: title, author, kind, wordCount };
+
+      const nToc = ctx.getString(infoRule.tocUrl, true);
       if (nIntro) intro = htmlToCleanText(nIntro);
       if (nCover && /^https?:\/\//i.test(nCover)) coverUrl = nCover;
       if (nLast) lastChapter = nLast;
@@ -383,7 +425,7 @@ export async function fetchBookDetail(source, meta, { timeoutMs = 10_000, signal
 
   return {
     entry,
-    meta: { ...meta, title, author, intro, coverUrl, lastChapter, tocUrl },
+    meta: { ...meta, title, author, kind, wordCount, intro, coverUrl, lastChapter, tocUrl },
   };
 }
 
@@ -391,9 +433,10 @@ export async function fetchChapterManifest(source, meta, publicationRef, { timeo
   const tocRule = source.ruleToc || {};
   let currentUrl = meta.tocUrl || meta.bookUrl;
   let effectiveMeta = meta;
+  const srcBase = String(source.bookSourceUrl || '').trim();
 
-  // If tocUrl wasn't resolved yet and ruleBookInfo.tocUrl exists, fetch detail first
-  if (!meta.tocUrl && source.ruleBookInfo?.tocUrl) {
+  // If tocUrl wasn't resolved yet and ruleBookInfo exists, fetch detail first so book.kind / vars / tocUrl are ready
+  if (!meta.tocUrl && (source.ruleBookInfo?.tocUrl || source.ruleBookInfo?.kind || source.ruleBookInfo?.name)) {
     const detailed = await fetchBookDetail(source, meta, { timeoutMs, signal });
     effectiveMeta = detailed.meta;
     currentUrl = detailed.meta.tocUrl || meta.bookUrl;
@@ -407,14 +450,26 @@ export async function fetchChapterManifest(source, meta, publicationRef, { timeo
   const usedIds = new Set();
   const maxPages = 20;
 
+  const contentRuleStr = JSON.stringify(source.ruleContent || '');
+  const contentNeedsVars = /java\.get\s*\(|@get:\{/i.test(contentRuleStr);
+  let sharedVars = null;
+  if (contentNeedsVars && effectiveMeta.vars && Object.keys(effectiveMeta.vars).length > 0) {
+    const picked = {};
+    for (const [k, v] of Object.entries(effectiveMeta.vars)) {
+      if (typeof v === 'string' && v.length <= 256 && Object.keys(picked).length < 8) picked[k] = v;
+    }
+    if (Object.keys(picked).length > 0 && JSON.stringify(picked).length <= 512) sharedVars = picked;
+  }
+
   for (let p = 0; p < maxPages && currentUrl && !visitedPages.has(currentUrl); p++) {
     visitedPages.add(currentUrl);
     const res = await fetchLegado(currentUrl, {
-      baseUrl: source.bookSourceUrl || '',
+      baseUrl: srcBase,
       sourceHeader: source.header || '',
       timeoutMs,
       signal,
     });
+    assertLegadoResponse(res, 'toc');
 
     const ctx = new RuleContext({
       source,
@@ -425,6 +480,8 @@ export async function fetchChapterManifest(source, meta, publicationRef, { timeo
         name: effectiveMeta.title || '',
         author: effectiveMeta.author || '',
         bookUrl: effectiveMeta.bookUrl || '',
+        kind: effectiveMeta.kind || '',
+        wordCount: effectiveMeta.wordCount || '',
       },
     });
 
@@ -437,7 +494,7 @@ export async function fetchChapterManifest(source, meta, publicationRef, { timeo
         elCtx.getString('a@href', true) ||
         res.url ||
         currentUrl;
-      if (!chTitle) continue;
+      if (!chTitle || /^javascript:/i.test(chUrl)) continue;
       if (chUrl && seenChapterUrls.has(`${chTitle}@@${chUrl}`)) continue;
       seenChapterUrls.add(`${chTitle}@@${chUrl}`);
 
@@ -446,6 +503,7 @@ export async function fetchChapterManifest(source, meta, publicationRef, { timeo
       while (usedIds.has(id)) id = `${id}x`;
       usedIds.add(id);
       const refObj = { s: source.bookSourceUrl, c: chUrl };
+      if (sharedVars) refObj.v = sharedVars;
       if (html) refObj.h = 1;
       const item = {
         id,
@@ -520,8 +578,9 @@ function applyReplaceRegex(rawContent, replaceRegex) {
  * asHtml=false -> { mediaType: 'text/plain', text }
  * asHtml=true  -> { mediaType: 'text/html', text: html with reader-res images }
  */
-export async function fetchChapterContent(source, chapterUrl, { timeoutMs = 12_000, signal, asHtml = false } = {}) {
+export async function fetchChapterContent(source, chapterUrl, { timeoutMs = 12_000, signal, asHtml = false, vars = {} } = {}) {
   const contentRule = source.ruleContent || {};
+  const srcBase = String(source.bookSourceUrl || '').trim();
   let currentUrl = chapterUrl;
   const visited = new Set();
   const parts = [];
@@ -531,16 +590,18 @@ export async function fetchChapterContent(source, chapterUrl, { timeoutMs = 12_0
   for (let p = 0; p < maxPages && currentUrl && !visited.has(currentUrl); p++) {
     visited.add(currentUrl);
     const res = await fetchLegado(currentUrl, {
-      baseUrl: source.bookSourceUrl || '',
+      baseUrl: srcBase,
       sourceHeader: source.header || '',
       timeoutMs,
       signal,
     });
+    assertLegadoResponse(res, 'content');
 
     const ctx = new RuleContext({
       source,
       baseUrl: res.url || currentUrl,
       content: res.body,
+      vars,
     });
 
     const rawContent = applyReplaceRegex(ctx.getString(contentRule.content), contentRule.replaceRegex);
@@ -630,7 +691,7 @@ export async function testSourceChain(source, keyword, { signal, stepTimeoutMs =
     const ch0 = decodeRef(manifest.items[0].ref);
     const asHtml = sourceUsesHtml(source);
     const content = await withDeadline(
-      fetchChapterContent(source, ch0.c, { timeoutMs: stepTimeoutMs, signal, asHtml }),
+      fetchChapterContent(source, ch0.c, { timeoutMs: stepTimeoutMs, signal, asHtml, vars: ch0.v || detailed.meta.vars || {} }),
       stepTimeoutMs * 2,
       '正文',
     );

@@ -1,7 +1,7 @@
 {
   "id": "legado-booksource",
   "name": "Legado 书源引擎",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "apiVersion": 1,
   "runtime": "node",
   "entry": "src/index.js",
@@ -14,6 +14,12 @@
       {
         "id": "manage",
         "title": "Legado 书源管理"
+      }
+    ],
+    "tasks": [
+      {
+        "id": "auto-check",
+        "intervalMinutes": 60
       }
     ]
   },

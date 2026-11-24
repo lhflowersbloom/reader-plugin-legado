@@ -18,7 +18,8 @@ import {
   resetBreakers,
   rankSources,
   isSupportedSourceType,
-  BREAKER_THRESHOLD,
+  getSettings,
+  updateSettings,
 } from './storage.js';
 import {
   searchWithSource,
@@ -122,10 +123,13 @@ function parseCursor(cursor) {
   return { planId: '', offset: Number.isNaN(n) ? 0 : n };
 }
 
-async function runBatchedSearch(dataDir, req, signal, { excludeUrl = '', filter = null } = {}) {
+async function runBatchedSearch(dataDir, req, signal, { excludeUrl = '', filter = null, sorter = null } = {}) {
   const query = String(req.query || '').trim();
   const limit = Number(req.limit) || 200;
   const resultLimit = Number(req.resultLimit) || 200;
+  const cfg = getSettings();
+  const batchSize = cfg.searchBatchSize || SEARCH_BATCH_SIZE;
+  const timeoutMs = cfg.searchTimeoutMs || SEARCH_TIMEOUT_MS;
 
   const sources = await getEnabledSources(dataDir);
   if (sources.length === 0) {
@@ -147,7 +151,7 @@ async function runBatchedSearch(dataDir, req, signal, { excludeUrl = '', filter 
   }
 
   const total = plan.urls.length;
-  const sliceUrls = plan.urls.slice(offset, offset + SEARCH_BATCH_SIZE);
+  const sliceUrls = plan.urls.slice(offset, offset + batchSize);
   const completed = Math.min(offset + sliceUrls.length, total);
 
   const items = [];
@@ -156,7 +160,7 @@ async function runBatchedSearch(dataDir, req, signal, { excludeUrl = '', filter 
     errors.push({
       source: 'legado',
       code: 'SOURCES_PAUSED',
-      message: `已暂时跳过 ${plan.skipped} 个连续失败 ${BREAKER_THRESHOLD} 次以上的书源（熔断中），可在插件管理页重置。`,
+      message: `已暂时跳过 ${plan.skipped} 个连续失败 ${cfg.breakerThreshold} 次以上的书源（熔断中），可在插件管理页重置。`,
     });
   }
 
@@ -166,7 +170,7 @@ async function runBatchedSearch(dataDir, req, signal, { excludeUrl = '', filter 
       if (!src || signal.aborted) return;
       const started = Date.now();
       try {
-        const found = await searchWithSource(src, query, { page: 1, timeoutMs: SEARCH_TIMEOUT_MS, signal });
+        const found = await searchWithSource(src, query, { page: 1, timeoutMs, signal });
         if (signal.aborted) return;
         recordSourceResult(url, { ok: true, ms: Date.now() - started });
         for (const { entry, meta } of found) {
@@ -186,6 +190,7 @@ async function runBatchedSearch(dataDir, req, signal, { excludeUrl = '', filter 
     }),
   );
 
+  if (sorter && items.length > 1) items.sort(sorter);
   const capped = items.slice(0, Math.min(limit, resultLimit));
   const limitReached = items.length >= resultLimit;
   const hasMore = completed < total && !limitReached;
@@ -205,32 +210,86 @@ async function handleSearch(params, signal) {
 }
 
 // ---------------------------------------------------------------------------
-// content.alternatives (换源)
+// content.alternatives (换源：支持去副标题与模糊匹配，防续作误判)
 // ---------------------------------------------------------------------------
+const EDITION_TAG_RE =
+  /[（(【\[][^）)】\]]*(全本|完本|完结|精校|校对|无删|未删|全集|连载|实体|出版|漫画|插图|免费|正版|最新|txt|修订|典藏|珍藏|作品)[^）)】\]]*[）)】\]]/gi;
+const SEQUEL_SUFFIX_RE = /^(2|3|4|二|三|四|ii|iii|续|续集|后传|外传|前传|番外|同人|仙界篇|神界篇|龙王传说|终极斗罗|绝世唐门|第二部|第三部|下部)/i;
+
 function normTitle(s) {
   return String(s ?? '')
     .toLowerCase()
-    .replace(/[（(【\[][^）)】\]]*(全本|完本|精校|校对|无删|全集|连载)[^）)】\]]*[）)】\]]/g, '')
+    .replace(EDITION_TAG_RE, '')
     .replace(/[\s·•・\-—_:：,，.。!！?？'"“”‘’《》<>()（）[\]【】]/g, '');
 }
 
+function baseMainTitle(s) {
+  const cleaned = String(s ?? '').replace(EDITION_TAG_RE, '').trim();
+  const main = cleaned.split(/\s*[:：—\-]\s*/)[0] || cleaned;
+  const n = normTitle(main);
+  return n.length >= 2 ? n : normTitle(cleaned);
+}
+
 function normAuthor(s) {
-  return normTitle(String(s ?? '').replace(/^\s*(作者|作\s*者)\s*[:：]?/, ''));
+  return normTitle(String(s ?? '').replace(/^\s*(作者|作\s*者|著)\s*[:：]?/, '').replace(/(著|编著|作品)$/, ''));
+}
+
+function extractChapterNum(s) {
+  if (!s) return 0;
+  const m = /第\s*(\d{1,5})\s*[章节回话]/.exec(String(s));
+  return m ? Number(m[1]) : 0;
+}
+
+function scoreAlternative(entry, wantExact, wantMain, wantAuthors) {
+  const tExact = normTitle(entry.title);
+  const tMain = baseMainTitle(entry.title);
+  if (!tExact || !wantExact) return -1;
+
+  const authors = (entry.authors || []).map(normAuthor).filter(Boolean);
+  const hasBothAuthors = wantAuthors.length > 0 && authors.length > 0;
+  const authorMatch = hasBothAuthors && authors.some((a) => wantAuthors.some((w) => a.includes(w) || w.includes(a)));
+  if (hasBothAuthors && !authorMatch) return -1;
+
+  let score = 0;
+  if (tExact === wantExact) {
+    score = 100;
+  } else if (tMain && wantMain && tMain === wantMain) {
+    const extra = tExact.startsWith(wantMain) ? tExact.slice(wantMain.length) : '';
+    if (extra && SEQUEL_SUFFIX_RE.test(extra) && !wantExact.includes(extra)) return -1;
+    score = authorMatch ? 85 : 70;
+  } else if (authorMatch && wantExact.length >= 2 && tExact.length >= 2) {
+    const [shorter, longer] = tExact.length <= wantExact.length ? [tExact, wantExact] : [wantExact, tExact];
+    if (longer.startsWith(shorter) && shorter.length / longer.length >= 0.6) {
+      const suffix = longer.slice(shorter.length);
+      if (SEQUEL_SUFFIX_RE.test(suffix)) return -1;
+      score = 65;
+    } else {
+      return -1;
+    }
+  } else {
+    return -1;
+  }
+
+  if (authorMatch) score += 10;
+  if (entry.latestChapter) score += 3;
+  return score;
 }
 
 async function handleAlternatives(params, signal) {
   const dataDir = getDataDir(params);
   const req = params.request || {};
   const decoded = decodeRef(req.publicationRef);
-  const wantTitle = normTitle(req.query);
+  const wantExact = normTitle(req.query);
+  const wantMain = baseMainTitle(req.query);
   const wantAuthors = (Array.isArray(req.authors) ? req.authors : []).map(normAuthor).filter(Boolean);
-  const filter = (entry) => {
-    if (!wantTitle || normTitle(entry.title) !== wantTitle) return false;
-    const authors = (entry.authors || []).map(normAuthor).filter(Boolean);
-    if (wantAuthors.length === 0 || authors.length === 0) return true;
-    return authors.some((a) => wantAuthors.some((w) => a.includes(w) || w.includes(a)));
+  const filter = (entry) => scoreAlternative(entry, wantExact, wantMain, wantAuthors) >= 0;
+  const sorter = (a, b) => {
+    const sa = scoreAlternative(a, wantExact, wantMain, wantAuthors);
+    const sb = scoreAlternative(b, wantExact, wantMain, wantAuthors);
+    if (sb !== sa) return sb - sa;
+    return extractChapterNum(b.latestChapter) - extractChapterNum(a.latestChapter);
   };
-  return runBatchedSearch(dataDir, req, signal, { excludeUrl: decoded?.s || '', filter });
+  return runBatchedSearch(dataDir, req, signal, { excludeUrl: decoded?.s || '', filter, sorter });
 }
 
 // ---------------------------------------------------------------------------
@@ -371,7 +430,7 @@ async function handleReadResource(params, signal) {
     return fetchImageResource(source, decoded.i, decoded.r || '', { signal });
   }
   // The media type is fixed by the manifest (h flag), never by current settings.
-  return fetchChapterContent(source, decoded.c, { signal, asHtml: decoded.h === 1 });
+  return fetchChapterContent(source, decoded.c, { signal, asHtml: decoded.h === 1, vars: decoded.v || {} });
 }
 
 // ---------------------------------------------------------------------------
@@ -774,9 +833,27 @@ async function renderManagePage(dataDir, userId, { notice, noticeKind, activeTab
     },
     {
       id: 'maintenance',
-      title: '维护',
-      description: `Cookie 已持久化保存（当前 ${cookies.domains} 个站点、${cookies.cookies} 条），容器重启后登录态仍然有效。搜索结果元数据缓存也已持久化。`,
+      title: '维护与设置',
+      description: `Cookie 已持久化保存（当前 ${cookies.domains} 个站点、${cookies.cookies} 条），容器重启后登录态仍然有效。搜索结果元数据缓存与运行参数也已持久化。${
+        getSettings().lastAutoCheckAt ? ` 最近定时测活：${fmtTime(getSettings().lastAutoCheckAt)}。` : ''
+      }`,
       forms: [
+        {
+          id: 'save-settings',
+          title: '运行参数与定时测活设置',
+          submit: '保存设置',
+          fields: [
+            { key: 'search_batch_size', label: '每批并发查源数（5–40）', type: 'number', value: getSettings().searchBatchSize, min: 5, max: 40 },
+            { key: 'search_timeout_ms', label: '单源搜索超时（毫秒，2000–20000）', type: 'number', value: getSettings().searchTimeoutMs, min: 2000, max: 20000 },
+            { key: 'breaker_threshold', label: '连续失败触发熔断次数（1–20）', type: 'number', value: getSettings().breakerThreshold, min: 1, max: 20 },
+            { key: 'breaker_base_minutes', label: '首次熔断冷却时长（分钟，1–1440）', type: 'number', value: getSettings().breakerBaseMinutes, min: 1, max: 1440 },
+            { key: 'breaker_max_hours', label: '最长熔断冷却时长（小时，1–72）', type: 'number', value: getSettings().breakerMaxHours, min: 1, max: 72 },
+            { key: 'auto_check_enabled', label: '启用宿主定时后台测活（extensions.tasks）', type: 'boolean', value: getSettings().autoCheckEnabled },
+            { key: 'auto_check_hours', label: '定时测活间隔（小时，1–168）', type: 'number', value: getSettings().autoCheckHours, min: 1, max: 168 },
+            { key: 'auto_check_keyword', label: '定时测活关键词', type: 'text', value: getSettings().autoCheckKeyword },
+            { key: 'auto_check_disable_failed', label: '定时测活后自动禁用失败书源', type: 'boolean', value: getSettings().autoCheckDisableFailed },
+          ],
+        },
         {
           id: 'clear-cookies',
           title: '清除全部 Cookie',
@@ -974,6 +1051,24 @@ async function handleExtensionAction(params, signal) {
     }
 
     // ----- maintenance
+    case 'save-settings': {
+      const saved = await updateSettings({
+        searchBatchSize: values.search_batch_size,
+        searchTimeoutMs: values.search_timeout_ms,
+        breakerThreshold: values.breaker_threshold,
+        breakerBaseMinutes: values.breaker_base_minutes,
+        breakerMaxHours: values.breaker_max_hours,
+        autoCheckEnabled: values.auto_check_enabled === true,
+        autoCheckHours: values.auto_check_hours,
+        autoCheckKeyword: values.auto_check_keyword,
+        autoCheckDisableFailed: values.auto_check_disable_failed === true,
+      });
+      return render(
+        `设置已保存：每批 ${saved.searchBatchSize} 源，超时 ${saved.searchTimeoutMs}ms，连续失败 ${saved.breakerThreshold} 次熔断（${saved.breakerBaseMinutes} 分钟–${saved.breakerMaxHours} 小时），定时测活${saved.autoCheckEnabled ? `已开启（每 ${saved.autoCheckHours} 小时）` : '已关闭'}。`,
+        'info',
+        'maintenance',
+      );
+    }
     case 'clear-cookies': {
       clearCookies();
       await flushCookies();
@@ -983,6 +1078,27 @@ async function handleExtensionAction(params, signal) {
     default:
       return render(`未知操作：${action}`, 'error');
   }
+}
+
+async function handleExtensionTask(params) {
+  const dataDir = getDataDir(params);
+  if (params.taskId !== 'auto-check') return { ok: true, ignored: true };
+  const cfg = getSettings();
+  if (!cfg.autoCheckEnabled || checkJob.running) {
+    return { ok: true, skipped: true };
+  }
+  const intervalMs = (cfg.autoCheckHours || 24) * 3600_000;
+  if (cfg.lastAutoCheckAt && Date.now() - cfg.lastAutoCheckAt < intervalMs - 60_000) {
+    return { ok: true, skipped: true };
+  }
+  await updateSettings({ lastAutoCheckAt: Date.now() });
+  const started = startCheckJob(dataDir, {
+    keyword: cfg.autoCheckKeyword || DEFAULT_TEST_KEYWORD,
+    scope: 'enabled',
+    concurrency: 6,
+    autoDisable: cfg.autoCheckDisableFailed === true,
+  });
+  return { ok: true, started };
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,6 +1152,9 @@ async function dispatch(msg) {
         break;
       case 'extension.action':
         result = await handleExtensionAction(params, ctrl.signal);
+        break;
+      case 'extension.task':
+        result = await handleExtensionTask(params);
         break;
       default:
         throw new Error(`Unsupported RPC method: ${method}`);

@@ -5,8 +5,174 @@ import { JSONPath } from 'jsonpath-plus';
 import xpath from 'xpath';
 import { DOMParser } from '@xmldom/xmldom';
 import iconv from 'iconv-lite';
-import { resolveUrl, getCookieForUrl, setCookieString, encodeQueryParam, DEFAULT_UA } from './http.js';
+import { resolveUrl, getCookieForUrl, setCookieString, removeCookie, encodeQueryParam, DEFAULT_UA } from './http.js';
 import { syncFetchLegado } from './sync-fetch.js';
+
+const CN_NUM_MAP = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+const CN_UNIT_MAP = { 十: 10, 百: 100, 千: 1000, 万: 10000 };
+
+function cnToNumber(cn) {
+  let section = 0;
+  let total = 0;
+  let num = 0;
+  let hasUnit = false;
+  for (const ch of cn) {
+    if (ch in CN_NUM_MAP) {
+      num = CN_NUM_MAP[ch];
+    } else if (ch in CN_UNIT_MAP) {
+      hasUnit = true;
+      const u = CN_UNIT_MAP[ch];
+      if (u === 10000) {
+        section = (section + num) * u;
+        total += section;
+        section = 0;
+      } else {
+        section += (num || (u === 10 && section === 0 ? 1 : 0)) * u;
+      }
+      num = 0;
+    }
+  }
+  if (!hasUnit) {
+    let digits = '';
+    for (const ch of cn) if (ch in CN_NUM_MAP) digits += String(CN_NUM_MAP[ch]);
+    return digits ? Number(digits) : NaN;
+  }
+  return total + section + num;
+}
+
+function toNumChapter(str) {
+  if (!str) return '';
+  return String(str).replace(/第([零〇一二两三四五六七八九十百千万]+)([章节回卷集部篇])/g, (full, cn, tail) => {
+    const n = cnToNumber(cn);
+    return Number.isNaN(n) ? full : `第${n}${tail}`;
+  });
+}
+
+function toNodeBytes(input) {
+  if (Buffer.isBuffer(input)) return input;
+  if (input instanceof Uint8Array) return Buffer.from(input);
+  if (Array.isArray(input)) return Buffer.from(input.map((b) => (b < 0 ? b + 256 : b & 0xff)));
+  return Buffer.from(String(input ?? ''), 'utf8');
+}
+
+function buildRhinoShim() {
+  function SecretKeySpec(keyBytes, alg) {
+    return { key: toNodeBytes(keyBytes), alg: String(alg || 'AES') };
+  }
+  function IvParameterSpec(ivBytes) {
+    return { iv: toNodeBytes(ivBytes) };
+  }
+  const Cipher = {
+    ENCRYPT_MODE: 1,
+    DECRYPT_MODE: 2,
+    getInstance(transformation) {
+      let mode = 2;
+      let keyBuf = Buffer.alloc(16);
+      let ivBuf = null;
+      const parts = String(transformation || 'AES/CBC/PKCS5Padding').split('/');
+      const algBase = parts[0].toUpperCase();
+      const blockMode = (parts[1] || 'ECB').toUpperCase();
+      const padding = (parts[2] || 'PKCS5PADDING').toUpperCase();
+      return {
+        init(opmode, keySpec, ivSpec) {
+          mode = Number(opmode);
+          keyBuf = keySpec?.key ? toNodeBytes(keySpec.key) : toNodeBytes(keySpec);
+          if (blockMode !== 'ECB') {
+            ivBuf = ivSpec?.iv ? toNodeBytes(ivSpec.iv) : (ivSpec ? toNodeBytes(ivSpec) : Buffer.alloc(algBase.startsWith('DES') ? 8 : 16));
+          }
+        },
+        doFinal(data) {
+          const buf = toNodeBytes(data);
+          let alg = 'aes-128-cbc';
+          if (algBase === 'AES') {
+            const bits = keyBuf.length <= 16 ? 128 : keyBuf.length <= 24 ? 192 : 256;
+            alg = blockMode === 'ECB' ? `aes-${bits}-ecb` : `aes-${bits}-${blockMode.toLowerCase()}`;
+          } else if (algBase === 'DES') {
+            alg = blockMode === 'ECB' ? 'des-ecb' : 'des-cbc';
+          } else if (algBase === 'DESEDE' || algBase === '3DES') {
+            alg = blockMode === 'ECB' ? 'des-ede3-ecb' : 'des-ede3-cbc';
+          }
+          const fn = mode === 1 ? crypto.createCipheriv : crypto.createDecipheriv;
+          const c = fn(alg, keyBuf, blockMode === 'ECB' ? null : ivBuf);
+          if (padding === 'NOPADDING') c.setAutoPadding(false);
+          return Buffer.concat([c.update(buf), c.final()]);
+        },
+      };
+    },
+  };
+  const Base64 = {
+    DEFAULT: 0,
+    NO_WRAP: 2,
+    getDecoder: () => ({ decode: (s) => Buffer.from(String(s ?? ''), 'base64') }),
+    getMimeDecoder: () => ({ decode: (s) => Buffer.from(String(s ?? '').replace(/\s+/g, ''), 'base64') }),
+    getEncoder: () => ({ encodeToString: (b) => toNodeBytes(b).toString('base64'), encode: (b) => Buffer.from(toNodeBytes(b).toString('base64')) }),
+    decode: (s) => Buffer.from(String(s ?? ''), 'base64'),
+    encodeToString: (b) => toNodeBytes(b).toString('base64'),
+  };
+  const Arrays = {
+    copyOfRange: (arr, from, to) => toNodeBytes(arr).subarray(Number(from) || 0, to === undefined ? undefined : Number(to)),
+    copyOf: (arr, len) => {
+      const src = toNodeBytes(arr);
+      const out = Buffer.alloc(Number(len) || 0);
+      src.copy(out, 0, 0, Math.min(src.length, out.length));
+      return out;
+    },
+  };
+  const MessageDigest = {
+    getInstance(alg) {
+      let h = crypto.createHash(nodeHashName(alg));
+      return {
+        update(b) { h.update(toNodeBytes(b)); },
+        digest(b) {
+          if (b !== undefined) h.update(toNodeBytes(b));
+          const res = h.digest();
+          h = crypto.createHash(nodeHashName(alg));
+          return res;
+        },
+      };
+    },
+  };
+  const Packages = {
+    java: {
+      lang: {
+        String: function JString(v, cs) {
+          if (Buffer.isBuffer(v) || v instanceof Uint8Array || Array.isArray(v)) {
+            const b = toNodeBytes(v);
+            const enc = cs ? String(cs).toLowerCase() : 'utf-8';
+            return enc !== 'utf-8' && enc !== 'utf8' && iconv.encodingExists(enc) ? iconv.decode(b, enc) : b.toString('utf8');
+          }
+          return String(v ?? '');
+        },
+      },
+      util: { Base64, Arrays },
+      security: { MessageDigest },
+    },
+    javax: {
+      crypto: {
+        Cipher,
+        spec: { SecretKeySpec, IvParameterSpec },
+      },
+    },
+    android: {
+      util: { Base64 },
+    },
+  };
+  function JavaImporter(...pkgs) {
+    const scope = {};
+    const addPkg = (p) => {
+      if (p && typeof p === 'object') {
+        for (const [k, v] of Object.entries(p)) {
+          if (k !== 'String') scope[k] = v;
+        }
+      }
+    };
+    pkgs.forEach(addPkg);
+    scope.importPackage = (...more) => more.forEach(addPkg);
+    return scope;
+  }
+  return { Packages, JavaImporter };
+}
+const RHINO_SHIM = buildRhinoShim();
 
 function md5Hex(input) {
   return crypto.createHash('md5').update(String(input ?? ''), 'utf8').digest('hex');
@@ -435,7 +601,10 @@ function evalCssRule(content, ruleStr, returnElements = false) {
       selector = (m ? m[1] : body).trim();
       if (m && !indexSpec) indexSpec = m[2];
     } else if (part.startsWith('text.')) {
-      textFilter = part.slice(5);
+      const body = part.slice(5);
+      const m = /^(.*?)\.(-?\d+)$/.exec(body);
+      textFilter = m ? m[1] : body;
+      if (m && !indexSpec) indexSpec = m[2];
       selector = '*';
     } else {
       const m = /^(.*?)\.(-?\d+)$/.exec(part);
@@ -455,7 +624,15 @@ function evalCssRule(content, ruleStr, returnElements = false) {
           found = [el];
         }
         if (textFilter !== null) {
-          found = found.filter((n) => $(n).text().includes(textFilter));
+          const candidates = found.filter((n) => !['html', 'head', 'body', 'script', 'style', 'noscript'].includes(n.tagName));
+          const ownMatches = candidates.filter((n) =>
+            $(n).contents().filter((_, c) => c.type === 'text').text().includes(textFilter),
+          );
+          found = ownMatches.length > 0
+            ? ownMatches
+            : candidates.filter(
+                (n) => $(n).text().includes(textFilter) && $(n).children().toArray().every((ch) => !$(ch).text().includes(textFilter)),
+              );
         }
         next.push(...found);
       } catch {
@@ -493,11 +670,13 @@ function evalXPathRule(content, ruleStr, returnElements = false) {
   const html = typeof content === 'string' ? content : String(content ?? '');
   const expr = ruleStr.startsWith('@XPath:') ? ruleStr.slice(7).trim() : ruleStr.trim();
   try {
-    // Normalize messy HTML5 into well-formed XHTML via cheerio before xmldom + xpath
-    const xhtml = cheerio.load(html).xml();
-    const doc = new DOMParser({
-      errorHandler: { warning() {}, error() {}, fatalError() {} },
-    }).parseFromString(xhtml, 'text/xml');
+    // Strip <script>/<style>, DOCTYPE, and default xmlns so XPath 1.0 unprefixed '//a' always works!
+    const $ = cheerio.load(html);
+    $('script,style,noscript').remove();
+    const xhtml = $.xml()
+      .replace(/<!DOCTYPE[^>]*>/gi, '')
+      .replace(/\s+xmlns=["'][^"']*["']/gi, '');
+    const doc = new DOMParser({ onError: () => {} }).parseFromString(xhtml, 'text/xml');
     const nodes = xpath.select(expr, doc);
     if (!Array.isArray(nodes)) return nodes !== undefined && nodes !== null ? [String(nodes)] : [];
     return nodes.map((n) => {
@@ -770,13 +949,19 @@ export class RuleContext {
         const m = new RegExp(`(?:^|;\\s*)${key}=([^;]*)`).exec(all);
         return m ? m[1] : '';
       },
+      removeCookie(tag) {
+        removeCookie(tag || self.baseUrl);
+      },
+      toNumChapter(str) {
+        return toNumChapter(str);
+      },
       log() {},
       toast() {},
       longToast() {},
     };
   }
 
-  runJs(code, result) {
+  runJs(code, result, fallbackOnErr = result) {
     const java = this.buildJavaApi();
     const decoratedResult = Array.isArray(result) ? decorateElementsArray(result) : result;
     const jsoupShim = {
@@ -801,26 +986,22 @@ export class RuleContext {
       key: this.key,
       page: this.page,
       org: { jsoup: { Jsoup: jsoupShim } },
+      Packages: RHINO_SHIM.Packages,
+      JavaImporter: RHINO_SHIM.JavaImporter,
+      __strToBytes: (s, cs) => {
+        const enc = cs ? String(cs).toLowerCase() : 'utf-8';
+        return enc !== 'utf-8' && enc !== 'utf8' && iconv.encodingExists(enc)
+          ? iconv.encode(String(s ?? ''), enc)
+          : Buffer.from(String(s ?? ''), 'utf8');
+      },
       cookie: {
         getCookie: (url) => getCookieForUrl(url || this.baseUrl),
         getKey: (url, k) => java.getCookie(url, k),
         setCookie: (url, value) => setCookieString(url || this.baseUrl, value),
         replaceCookie: (url, value) => setCookieString(url || this.baseUrl, value),
+        removeCookie: (url) => removeCookie(url || this.baseUrl),
       },
-      String,
-      Number,
-      Boolean,
-      Array,
-      Object,
-      JSON,
-      Math,
-      Date,
-      RegExp,
-      Map,
-      Set,
-      parseInt,
-      parseFloat,
-      isNaN,
+      Buffer,
       encodeURIComponent,
       decodeURIComponent,
       encodeURI,
@@ -829,11 +1010,23 @@ export class RuleContext {
     };
     const ctx = vm.createContext(sandbox);
     try {
-      const out = vm.runInContext(code, ctx, { timeout: 5000 });
+      vm.runInContext(
+        'if (!String.prototype.getBytes) { Object.defineProperty(String.prototype, "getBytes", { value: function(cs) { return __strToBytes(this, cs); }, configurable: true }); }',
+        ctx,
+        { timeout: 1000 },
+      );
+      const jsLib = this.source?.jsLib ? `${this.source.jsLib}\n` : '';
+      const out = vm.runInContext(`${jsLib}${code}`, ctx, { timeout: 5000 });
       return out !== undefined ? out : sandbox.result;
     } catch {
-      return result;
+      return fallbackOnErr;
     }
+  }
+
+  prepareJsCode(code) {
+    const raw = String(code ?? '');
+    if (!raw.includes('{{') && !raw.includes('@get:')) return raw;
+    return this.interpolateTemplate(raw);
   }
 
   interpolateTemplate(str, extra = {}) {
@@ -848,14 +1041,17 @@ export class RuleContext {
       const trimmed = expr.trim();
       if (trimmed === 'key') return extra.encodedKey ?? this.key;
       if (trimmed === 'page') return String(this.page);
-      if (trimmed.startsWith('$.') || trimmed.startsWith('$[')) {
+      if (trimmed.startsWith('$.') || trimmed.startsWith('$[') || trimmed.startsWith('@Json:')) {
         const vals = evalJsonRule(this.content, trimmed);
         return vals.length > 0 ? String(vals[0]) : '';
       }
       if (trimmed.startsWith('@@')) {
         return this.getString(trimmed.slice(2));
       }
-      const val = this.runJs(trimmed, this.content);
+      if (trimmed.startsWith('@css:') || trimmed.startsWith('@XPath:') || trimmed.startsWith('//')) {
+        return this.getString(trimmed);
+      }
+      const val = this.runJs(trimmed, this.content, '');
       return val !== undefined && val !== null ? String(val) : '';
     });
 
@@ -927,7 +1123,7 @@ export class RuleContext {
         const seg = segments[i];
         const isLast = i === segments.length - 1;
         if (seg.type === 'js') {
-          cur = this.runJs(seg.val, cur);
+          cur = this.runJs(this.prepareJsCode(seg.val), cur);
         } else {
           // Support || and && inside pipeline rule segments
           const orParts = splitTopLevel(seg.val, '||');
@@ -970,11 +1166,13 @@ export class RuleContext {
     }
 
     if (jsParts.length > 0) {
-      let cur = returnElements
-        ? decorateElementsArray(result)
-        : (result.length <= 1 ? (result[0] ?? '') : result.join('\n'));
+      let cur = !base
+        ? this.content
+        : returnElements
+          ? decorateElementsArray(result)
+          : (result.length <= 1 ? (result[0] ?? '') : result.join('\n'));
       for (const code of jsParts) {
-        cur = this.runJs(code, cur);
+        cur = this.runJs(this.prepareJsCode(code), cur);
       }
       if (Array.isArray(cur)) return cur;
       return cur !== undefined && cur !== null && cur !== '' ? [cur] : [];
@@ -991,6 +1189,9 @@ export class RuleContext {
     let effective = raw;
     if (effective.startsWith('-')) {
       reverse = true;
+      effective = effective.slice(1).trim();
+    }
+    if (effective.startsWith('+')) {
       effective = effective.slice(1).trim();
     }
 
@@ -1026,7 +1227,7 @@ export class RuleContext {
       if (jsParts.length > 0) {
         let cur = decorateElementsArray(collected);
         for (const code of jsParts) {
-          cur = this.runJs(code, cur);
+          cur = this.runJs(this.prepareJsCode(code), cur);
         }
         collected = Array.isArray(cur) ? cur : (cur ? [cur] : []);
       }
@@ -1037,8 +1238,9 @@ export class RuleContext {
   }
 
   getStringList(rule, isUrl = false) {
-    const raw = String(rule ?? '').trim();
+    let raw = String(rule ?? '').trim();
     if (!raw) return [];
+    if (raw.startsWith('+')) raw = raw.slice(1).trim();
 
     if (/<js>[\s\S]*?<\/js>/i.test(raw)) {
       const res = this.evalSingleRule(raw, false);
@@ -1078,7 +1280,7 @@ export class RuleContext {
         if (jsParts.length > 0) {
           let cur = collected.join('\n');
           for (const code of jsParts) {
-            cur = this.runJs(code, cur);
+            cur = this.runJs(this.prepareJsCode(code), cur);
           }
           collected = Array.isArray(cur) ? cur : (cur !== undefined && cur !== null ? [cur] : []);
         }

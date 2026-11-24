@@ -8,7 +8,7 @@ let worker = null;
 
 function getWorker() {
   if (!worker) {
-    worker = new Worker(join(__dirname, 'sync-fetch-worker.js'));
+    worker = new Worker(join(__dirname, 'sync-fetch-worker.js'), { execArgv: [] });
     worker.unref();
     worker.on('exit', () => {
       worker = null;
