@@ -40,7 +40,7 @@ import { fetchLegado, initCookieStore, clearCookies, cookieStats, flushCookies }
 const inFlight = new Map(); // rpcId -> AbortController
 
 const SEARCH_BATCH_SIZE = 15;
-const SEARCH_TIMEOUT_MS = 7000;
+const SEARCH_TIMEOUT_MS = 15000;
 const PAGE_SIZE = 50;
 const DEFAULT_TEST_KEYWORD = '凡人修仙传';
 
@@ -501,6 +501,8 @@ function startCheckJob(dataDir, { keyword, scope, concurrency, autoDisable }) {
         (s) => s.searchUrl && isSupportedSourceType(s, { allowComic: true }) && (scope === 'all' || isEnabled(s)),
       );
       checkJob.total = targets.length;
+      // Health checks use the same per-request timeout as live searches (settings page).
+      const stepTimeoutMs = getSettings().searchTimeoutMs || SEARCH_TIMEOUT_MS;
       const failedUrls = [];
       await runPool(
         targets,
@@ -509,7 +511,7 @@ function startCheckJob(dataDir, { keyword, scope, concurrency, autoDisable }) {
           const url = src.bookSourceUrl;
           let r;
           try {
-            r = await testSourceChain(src, keyword, { signal: controller.signal, stepTimeoutMs: 8000 });
+            r = await testSourceChain(src, keyword, { signal: controller.signal, stepTimeoutMs });
           } catch (err) {
             r = { ok: false, stage: 'search', message: errMessage(err), ms: 0 };
           }
@@ -759,7 +761,7 @@ async function renderManagePage(dataDir, userId, { notice, noticeKind, activeTab
                 { value: 'all', label: '全部书源' },
               ],
             },
-            { key: 'concurrency', label: '并发数', type: 'number', value: 8, min: 1, max: 16 },
+            { key: 'concurrency', label: '并发数（慢源多时建议 4）', type: 'number', value: getSettings().checkConcurrency, min: 1, max: 16 },
             { key: 'auto_disable', label: '检测完成后自动禁用失败的书源', type: 'boolean', value: false },
           ],
         },
@@ -844,7 +846,8 @@ async function renderManagePage(dataDir, userId, { notice, noticeKind, activeTab
           submit: '保存设置',
           fields: [
             { key: 'search_batch_size', label: '每批并发查源数（5–40）', type: 'number', value: getSettings().searchBatchSize, min: 5, max: 40 },
-            { key: 'search_timeout_ms', label: '单源搜索超时（毫秒，2000–20000）', type: 'number', value: getSettings().searchTimeoutMs, min: 2000, max: 20000 },
+            { key: 'search_timeout_ms', label: '单源请求超时（毫秒，2000–20000；搜索与测活共用）', type: 'number', value: getSettings().searchTimeoutMs, min: 2000, max: 20000 },
+            { key: 'check_concurrency', label: '测活并发数（1–16，含定时测活）', type: 'number', value: getSettings().checkConcurrency, min: 1, max: 16 },
             { key: 'breaker_threshold', label: '连续失败触发熔断次数（1–20）', type: 'number', value: getSettings().breakerThreshold, min: 1, max: 20 },
             { key: 'breaker_base_minutes', label: '首次熔断冷却时长（分钟，1–1440）', type: 'number', value: getSettings().breakerBaseMinutes, min: 1, max: 1440 },
             { key: 'breaker_max_hours', label: '最长熔断冷却时长（小时，1–72）', type: 'number', value: getSettings().breakerMaxHours, min: 1, max: 72 },
@@ -960,7 +963,8 @@ async function handleExtensionAction(params, signal) {
       let r;
       try {
         r = await withTimeout(
-          testSourceChain(src, keyword, { signal, stepTimeoutMs: 5000 }),
+          // Single checks must finish within the 24 s action budget.
+          testSourceChain(src, keyword, { signal, stepTimeoutMs: Math.min(getSettings().searchTimeoutMs || SEARCH_TIMEOUT_MS, 8000) }),
           24_000,
           '检测超过 24 秒，已中止（可在“测活”页用后台检测）',
         );
@@ -980,7 +984,8 @@ async function handleExtensionAction(params, signal) {
     case 'check-start': {
       const keyword = String(values.keyword || '').trim() || DEFAULT_TEST_KEYWORD;
       const scope = values.scope === 'all' ? 'all' : 'enabled';
-      const concurrency = Math.min(16, Math.max(1, Number.parseInt(String(values.concurrency ?? '8'), 10) || 8));
+      const defConc = getSettings().checkConcurrency || 4;
+      const concurrency = Math.min(16, Math.max(1, Number.parseInt(String(values.concurrency ?? defConc), 10) || defConc));
       const started = startCheckJob(dataDir, { keyword, scope, concurrency, autoDisable: values.auto_disable === true });
       return render(started ? '测活已在后台开始，稍后点击“刷新进度”查看。' : '已有测活任务在运行。', started ? 'info' : 'error', 'check');
     }
@@ -1055,6 +1060,7 @@ async function handleExtensionAction(params, signal) {
       const saved = await updateSettings({
         searchBatchSize: values.search_batch_size,
         searchTimeoutMs: values.search_timeout_ms,
+        ...(values.check_concurrency !== undefined ? { checkConcurrency: values.check_concurrency } : {}),
         breakerThreshold: values.breaker_threshold,
         breakerBaseMinutes: values.breaker_base_minutes,
         breakerMaxHours: values.breaker_max_hours,
@@ -1064,7 +1070,7 @@ async function handleExtensionAction(params, signal) {
         autoCheckDisableFailed: values.auto_check_disable_failed === true,
       });
       return render(
-        `设置已保存：每批 ${saved.searchBatchSize} 源，超时 ${saved.searchTimeoutMs}ms，连续失败 ${saved.breakerThreshold} 次熔断（${saved.breakerBaseMinutes} 分钟–${saved.breakerMaxHours} 小时），定时测活${saved.autoCheckEnabled ? `已开启（每 ${saved.autoCheckHours} 小时）` : '已关闭'}。`,
+        `设置已保存：每批 ${saved.searchBatchSize} 源，超时 ${saved.searchTimeoutMs}ms，测活并发 ${saved.checkConcurrency}，连续失败 ${saved.breakerThreshold} 次熔断（${saved.breakerBaseMinutes} 分钟–${saved.breakerMaxHours} 小时），定时测活${saved.autoCheckEnabled ? `已开启（每 ${saved.autoCheckHours} 小时）` : '已关闭'}。`,
         'info',
         'maintenance',
       );
@@ -1095,7 +1101,7 @@ async function handleExtensionTask(params) {
   const started = startCheckJob(dataDir, {
     keyword: cfg.autoCheckKeyword || DEFAULT_TEST_KEYWORD,
     scope: 'enabled',
-    concurrency: 6,
+    concurrency: cfg.checkConcurrency || 4,
     autoDisable: cfg.autoCheckDisableFailed === true,
   });
   return { ok: true, started };

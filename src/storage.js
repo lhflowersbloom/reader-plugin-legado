@@ -14,7 +14,8 @@ async function readJson(file, fallback) {
 
 async function writeJsonAtomic(file, data, pretty = false) {
   await mkdir(dirname(file), { recursive: true });
-  const tmp = `${file}.tmp`;
+  // Unique temp name: two writers of the same file must never share a temp file.
+  const tmp = `${file}.${process.pid}.${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}.tmp`;
   await writeFile(tmp, pretty ? JSON.stringify(data, null, 2) : JSON.stringify(data), 'utf8');
   await rename(tmp, file);
 }
@@ -223,7 +224,7 @@ function compactMeta(meta) {
 const metaWriter = createDebouncedWriter(
   () => metaFile,
   () => [...bookMetaCache.entries()],
-  3000,
+  10_000, // ~1.3 MB file: write it at most every 10 s during a search burst
 );
 
 export function cacheBookMeta(ref, meta) {
@@ -252,10 +253,11 @@ export function getCachedBookMeta(ref) {
 // ---------------------------------------------------------------------------
 export const DEFAULT_SETTINGS = {
   searchBatchSize: 15,
-  searchTimeoutMs: 7000,
+  searchTimeoutMs: 15000,
   breakerThreshold: 3,
   breakerBaseMinutes: 10,
   breakerMaxHours: 6,
+  checkConcurrency: 4,
   autoCheckEnabled: false,
   autoCheckHours: 24,
   autoCheckKeyword: '凡人修仙传',
@@ -279,6 +281,7 @@ function sanitizeSettings(raw = {}) {
     breakerThreshold: clampInt(raw.breakerThreshold, 1, 20, DEFAULT_SETTINGS.breakerThreshold),
     breakerBaseMinutes: clampInt(raw.breakerBaseMinutes, 1, 1440, DEFAULT_SETTINGS.breakerBaseMinutes),
     breakerMaxHours: clampInt(raw.breakerMaxHours, 1, 72, DEFAULT_SETTINGS.breakerMaxHours),
+    checkConcurrency: clampInt(raw.checkConcurrency, 1, 16, DEFAULT_SETTINGS.checkConcurrency),
     autoCheckEnabled: raw.autoCheckEnabled === true,
     autoCheckHours: clampInt(raw.autoCheckHours, 1, 168, DEFAULT_SETTINGS.autoCheckHours),
     autoCheckKeyword: String(raw.autoCheckKeyword || DEFAULT_SETTINGS.autoCheckKeyword).trim().slice(0, 50) || DEFAULT_SETTINGS.autoCheckKeyword,

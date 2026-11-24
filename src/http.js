@@ -340,9 +340,17 @@ export function parseLegadoUrl(rawUrl, baseUrl = '', sourceHeader = '') {
   return { url: finalUrl, method, headers, body, charset, rawOpts: opts };
 }
 
+/** GB2312 / GBK pages routinely contain GBK-only characters: decode them as GB18030 (a superset). */
+function decodeCharset(cs) {
+  const c = String(cs || '').toLowerCase();
+  if (c === 'gb2312' || c === 'gbk' || c === 'gb_2312-80' || c === 'x-gbk') return 'gb18030';
+  return c;
+}
+
 function detectCharset(contentType, buf, hintCharset) {
   if (hintCharset) return hintCharset;
-  const ctMatch = /charset=([a-zA-Z0-9_-]+)/i.exec(contentType || '');
+  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) return 'utf-8';
+  const ctMatch = /charset\s*=\s*["']?\s*([a-zA-Z0-9_-]+)/i.exec(contentType || '');
   if (ctMatch) return ctMatch[1].toLowerCase();
   // Peek first 2KB as latin1 for <meta charset="...">
   const head = buf.subarray(0, 2048).toString('latin1');
@@ -356,15 +364,66 @@ function hasHeader(headers, name) {
   return Object.keys(headers).some((k) => k.toLowerCase() === lower);
 }
 
+const RETRY_STATUS = new Set([502, 504]);
+
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new Error('aborted'));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new Error('aborted'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 /**
- * Fetch a Legado-style URL.
+ * Fetch a Legado-style URL, retrying network errors / timeouts / 502 / 504.
+ *
+ * options.retries: extra attempts (default 0); the URL option `retry` (Legado)
+ *   raises it. Capped at 3. Never retries after the caller aborted.
+ * Other options: see fetchLegadoOnce.
+ */
+export async function fetchLegado(rawUrl, options = {}) {
+  let urlRetry = 0;
+  try {
+    urlRetry = Number(parseLegadoUrl(rawUrl, options.baseUrl || '', '').rawOpts?.retry) || 0;
+  } catch {
+    urlRetry = 0;
+  }
+  const retries = Math.min(3, Math.max(0, Number(options.retries) || 0, urlRetry));
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const res = await fetchLegadoOnce(rawUrl, options);
+      if (attempt < retries && RETRY_STATUS.has(res.status)) {
+        await sleep(400 * (attempt + 1), options.signal);
+        continue;
+      }
+      return res;
+    } catch (err) {
+      const msg = String(err?.message || err);
+      if (options.signal?.aborted || attempt >= retries || /^(Invalid URL|RESPONSE_TOO_LARGE)/.test(msg)) throw err;
+      await sleep(400 * (attempt + 1), options.signal);
+    }
+  }
+}
+
+/**
+ * Fetch a Legado-style URL once.
  *
  * options.cookieHeader: Cookie header to send instead of looking up the jar
  *   (the sync-fetch worker uses this, because its jar is not the real one).
  * options.binary: return the raw Buffer in `buffer` and skip text decoding.
  * options.maxBytes: abort bodies larger than this (binary downloads).
  */
-export async function fetchLegado(rawUrl, options = {}) {
+async function fetchLegadoOnce(rawUrl, options = {}) {
   const {
     baseUrl = '',
     sourceHeader = '',
@@ -441,11 +500,12 @@ export async function fetchLegado(rawUrl, options = {}) {
     };
     if (binary) return { ...base, buffer: buf };
 
-    const cs = detectCharset(res.headers.get('content-type'), buf, parsed.charset);
-    const text =
+    const cs = decodeCharset(detectCharset(res.headers.get('content-type'), buf, parsed.charset));
+    const text = (
       cs === 'utf-8' || cs === 'utf8' || !iconv.encodingExists(cs)
         ? buf.toString('utf8')
-        : iconv.decode(buf, cs);
+        : iconv.decode(buf, cs)
+    ).replace(/^\uFEFF/, '');
 
     return { ...base, body: text };
   } finally {

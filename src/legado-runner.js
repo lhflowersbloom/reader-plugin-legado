@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import * as cheerio from 'cheerio';
 import { fetchLegado, encodeQueryParam, parseLegadoUrl, resolveUrl } from './http.js';
-import { RuleContext, htmlToCleanText } from './engine.js';
+import { RuleContext, htmlToCleanText, resolveSourceHeader } from './engine.js';
 
 function shortHash(input) {
   return createHash('sha256').update(String(input)).digest('hex').slice(0, 16);
@@ -129,7 +129,7 @@ export async function fetchImageResource(source, imageUrl, referer, { timeoutMs 
   const extraHeaders = referer ? { Referer: referer } : undefined;
   const res = await fetchLegado(imageUrl, {
     baseUrl: referer || source.bookSourceUrl || '',
-    sourceHeader: source.header || '',
+    sourceHeader: resolveSourceHeader(source),
     timeoutMs,
     signal,
     binary: true,
@@ -260,7 +260,7 @@ export async function searchWithSource(source, query, { page = 1, timeoutMs = 80
 
   const res = await fetchLegado(searchUrl, {
     baseUrl: String(source.bookSourceUrl || '').trim(),
-    sourceHeader: source.header || '',
+    sourceHeader: resolveSourceHeader(source),
     timeoutMs,
     signal,
   });
@@ -337,7 +337,7 @@ export async function exploreWithSource(source, exploreUrl, { page = 1, timeoutM
 
   const res = await fetchLegado(url, {
     baseUrl,
-    sourceHeader: source.header || '',
+    sourceHeader: resolveSourceHeader(source),
     timeoutMs,
     signal,
   });
@@ -351,10 +351,59 @@ export async function exploreWithSource(source, exploreUrl, { page = 1, timeoutM
 // ---------------------------------------------------------------------------
 // Detail / TOC / content
 // ---------------------------------------------------------------------------
+
+// Most sources have no tocUrl rule and use the detail page as the TOC page.
+// Keep detail responses briefly so the TOC request can reuse them instead of
+// downloading the same page twice (one-shot: later refreshes hit the network).
+const PAGE_CACHE = new Map();
+const PAGE_CACHE_TTL_MS = 2 * 60_000;
+const PAGE_CACHE_MAX = 32;
+const PAGE_FETCH_CONCURRENCY = 4;
+
+function pageCacheKey(source, url) {
+  return `${source?.bookSourceUrl || ''}\n${url}`;
+}
+
+function rememberPage(source, url, res) {
+  if (!url || !res || res.status >= 400) return;
+  const key = pageCacheKey(source, url);
+  PAGE_CACHE.delete(key);
+  PAGE_CACHE.set(key, { res, at: Date.now() });
+  while (PAGE_CACHE.size > PAGE_CACHE_MAX) PAGE_CACHE.delete(PAGE_CACHE.keys().next().value);
+}
+
+function recallPage(source, url) {
+  const key = pageCacheKey(source, url);
+  const hit = PAGE_CACHE.get(key);
+  if (!hit) return null;
+  PAGE_CACHE.delete(key);
+  return Date.now() - hit.at <= PAGE_CACHE_TTL_MS ? hit.res : null;
+}
+
+function requestOptions(source, extra = {}) {
+  return {
+    baseUrl: String(source.bookSourceUrl || '').trim(),
+    sourceHeader: resolveSourceHeader(source),
+    ...extra,
+  };
+}
+
+/** Take up to `max` not-yet-visited URLs from the queue (marking them visited). */
+function takeBatch(queue, visited, max) {
+  const batch = [];
+  while (queue.length > 0 && batch.length < max) {
+    const u = queue.shift();
+    if (u && !visited.has(u)) {
+      visited.add(u);
+      batch.push(u);
+    }
+  }
+  return batch;
+}
+
 export async function fetchBookDetail(source, meta, { timeoutMs = 10_000, signal } = {}) {
   const bookUrl = meta.bookUrl;
   const infoRule = source.ruleBookInfo || {};
-  const srcBase = String(source.bookSourceUrl || '').trim();
 
   let title = meta.title || '未命名';
   let author = meta.author || '';
@@ -367,12 +416,8 @@ export async function fetchBookDetail(source, meta, { timeoutMs = 10_000, signal
 
   if (bookUrl && Object.keys(infoRule).length > 0) {
     try {
-      const res = await fetchLegado(bookUrl, {
-        baseUrl: srcBase,
-        sourceHeader: source.header || '',
-        timeoutMs,
-        signal,
-      });
+      const res = await fetchLegado(bookUrl, requestOptions(source, { timeoutMs, signal, retries: 1 }));
+      rememberPage(source, bookUrl, res);
 
       const ctx = new RuleContext({
         source,
@@ -429,17 +474,21 @@ export async function fetchBookDetail(source, meta, { timeoutMs = 10_000, signal
   };
 }
 
-export async function fetchChapterManifest(source, meta, publicationRef, { timeoutMs = 12_000, signal } = {}) {
+/**
+ * Build the chapter manifest. nextTocUrl may return one URL (followed as a
+ * chain) or several (fetched concurrently), as in Legado.
+ * Returns { manifest, truncated }.
+ */
+async function buildChapterManifest(source, meta, publicationRef, { timeoutMs = 12_000, signal, maxTocPages = 100 } = {}) {
   const tocRule = source.ruleToc || {};
-  let currentUrl = meta.tocUrl || meta.bookUrl;
+  let startUrl = meta.tocUrl || meta.bookUrl;
   let effectiveMeta = meta;
-  const srcBase = String(source.bookSourceUrl || '').trim();
 
   // If tocUrl wasn't resolved yet and ruleBookInfo exists, fetch detail first so book.kind / vars / tocUrl are ready
   if (!meta.tocUrl && (source.ruleBookInfo?.tocUrl || source.ruleBookInfo?.kind || source.ruleBookInfo?.name)) {
     const detailed = await fetchBookDetail(source, meta, { timeoutMs, signal });
     effectiveMeta = detailed.meta;
-    currentUrl = detailed.meta.tocUrl || meta.bookUrl;
+    startUrl = detailed.meta.tocUrl || meta.bookUrl;
   }
 
   const html = sourceUsesHtml(source);
@@ -448,10 +497,10 @@ export async function fetchChapterManifest(source, meta, publicationRef, { timeo
   const visitedPages = new Set();
   const seenChapterUrls = new Set();
   const usedIds = new Set();
-  const maxPages = 20;
+  const maxPages = Math.max(1, Math.min(500, Number(maxTocPages) || 100));
 
   const contentRuleStr = JSON.stringify(source.ruleContent || '');
-  const contentNeedsVars = /java\.get\s*\(|@get:\{/i.test(contentRuleStr);
+  const contentNeedsVars = /java\.get\s*\(|@get:\{|getVariable\s*\(/i.test(contentRuleStr);
   let sharedVars = null;
   if (contentNeedsVars && effectiveMeta.vars && Object.keys(effectiveMeta.vars).length > 0) {
     const picked = {};
@@ -461,83 +510,105 @@ export async function fetchChapterManifest(source, meta, publicationRef, { timeo
     if (Object.keys(picked).length > 0 && JSON.stringify(picked).length <= 512) sharedVars = picked;
   }
 
-  for (let p = 0; p < maxPages && currentUrl && !visitedPages.has(currentUrl); p++) {
-    visitedPages.add(currentUrl);
-    const res = await fetchLegado(currentUrl, {
-      baseUrl: srcBase,
-      sourceHeader: source.header || '',
-      timeoutMs,
-      signal,
-    });
-    assertLegadoResponse(res, 'toc');
+  const queue = startUrl ? [startUrl] : [];
+  let pages = 0;
+  let truncated = false;
+  let firstBatch = true;
 
-    const ctx = new RuleContext({
-      source,
-      baseUrl: res.url || currentUrl,
-      content: res.body,
-      vars: effectiveMeta.vars || {},
-      book: {
-        name: effectiveMeta.title || '',
-        author: effectiveMeta.author || '',
-        bookUrl: effectiveMeta.bookUrl || '',
-        kind: effectiveMeta.kind || '',
-        wordCount: effectiveMeta.wordCount || '',
-      },
-    });
+  while (queue.length > 0 && pages < maxPages) {
+    const batch = takeBatch(queue, visitedPages, Math.min(PAGE_FETCH_CONCURRENCY, maxPages - pages));
+    if (batch.length === 0) continue;
+    pages += batch.length;
+    const cachedFirst = firstBatch ? recallPage(source, batch[0]) : null;
+    firstBatch = false;
+    const settled = await Promise.allSettled(
+      batch.map((u, i) =>
+        i === 0 && cachedFirst
+          ? Promise.resolve(cachedFirst)
+          : fetchLegado(u, requestOptions(source, { timeoutMs, signal, retries: 1 })),
+      ),
+    );
 
-    const listEls = ctx.getElements(tocRule.chapterList);
-    for (const el of listEls) {
-      const elCtx = ctx.cloneWith({ content: el });
-      const chTitle = elCtx.getString(tocRule.chapterName || 'text');
-      const chUrl =
-        elCtx.getString(tocRule.chapterUrl || 'href', true) ||
-        elCtx.getString('a@href', true) ||
-        res.url ||
-        currentUrl;
-      if (!chTitle || /^javascript:/i.test(chUrl)) continue;
-      if (chUrl && seenChapterUrls.has(`${chTitle}@@${chUrl}`)) continue;
-      seenChapterUrls.add(`${chTitle}@@${chUrl}`);
+    for (let b = 0; b < batch.length; b++) {
+      const pageUrl = batch[b];
+      let res;
+      try {
+        if (settled[b].status === 'rejected') throw settled[b].reason;
+        res = settled[b].value;
+        assertLegadoResponse(res, 'toc');
+      } catch (err) {
+        // The first page must work; a failing later page only truncates the TOC.
+        if (signal?.aborted || chapters.length === 0) throw err;
+        truncated = true;
+        continue;
+      }
 
-      const seq = chapters.length;
-      let id = `ch-${seq}-${shortHash(chUrl || chTitle)}`;
-      while (usedIds.has(id)) id = `${id}x`;
-      usedIds.add(id);
-      const refObj = { s: source.bookSourceUrl, c: chUrl };
-      if (sharedVars) refObj.v = sharedVars;
-      if (html) refObj.h = 1;
-      const item = {
-        id,
-        ref: encodeRef(refObj),
-        title: chTitle,
-        mediaType,
-        kind: 'chapter',
-        seq,
-      };
-      if (chUrl && /^https?:\/\//i.test(chUrl)) {
-        try {
-          const cleanUrl = chUrl.replace(/,\s*\{[\s\S]*\}$/, '').trim();
-          const parsed = new URL(cleanUrl);
-          if (!parsed.username && !parsed.password) {
-            item.sourceUrl = parsed.href;
+      const ctx = new RuleContext({
+        source,
+        baseUrl: res.url || pageUrl,
+        content: res.body,
+        vars: effectiveMeta.vars || {},
+        book: {
+          name: effectiveMeta.title || '',
+          author: effectiveMeta.author || '',
+          bookUrl: effectiveMeta.bookUrl || '',
+          kind: effectiveMeta.kind || '',
+          wordCount: effectiveMeta.wordCount || '',
+        },
+      });
+
+      const listEls = ctx.getElements(tocRule.chapterList);
+      for (const el of listEls) {
+        const elCtx = ctx.cloneWith({ content: el });
+        const chTitle = elCtx.getString(tocRule.chapterName || 'text');
+        const chUrl =
+          elCtx.getString(tocRule.chapterUrl || 'href', true) ||
+          elCtx.getString('a@href', true) ||
+          res.url ||
+          pageUrl;
+        if (!chTitle || /^javascript:/i.test(chUrl)) continue;
+        if (chUrl && seenChapterUrls.has(`${chTitle}@@${chUrl}`)) continue;
+        seenChapterUrls.add(`${chTitle}@@${chUrl}`);
+
+        const seq = chapters.length;
+        let id = `ch-${seq}-${shortHash(chUrl || chTitle)}`;
+        while (usedIds.has(id)) id = `${id}x`;
+        usedIds.add(id);
+        const refObj = { s: source.bookSourceUrl, c: chUrl };
+        if (sharedVars) refObj.v = sharedVars;
+        if (html) refObj.h = 1;
+        const item = {
+          id,
+          ref: encodeRef(refObj),
+          title: chTitle,
+          mediaType,
+          kind: 'chapter',
+          seq,
+        };
+        if (chUrl && /^https?:\/\//i.test(chUrl)) {
+          try {
+            const cleanUrl = chUrl.replace(/,\s*\{[\s\S]*\}$/, '').trim();
+            const parsed = new URL(cleanUrl);
+            if (!parsed.username && !parsed.password) {
+              item.sourceUrl = parsed.href;
+            }
+          } catch {
+            // ignore
           }
-        } catch {
-          // ignore
+        }
+        chapters.push(item);
+      }
+
+      if (tocRule.nextTocUrl) {
+        for (const nextUrl of ctx.getStringList(tocRule.nextTocUrl, true)) {
+          if (nextUrl && nextUrl !== pageUrl && !visitedPages.has(nextUrl) && !queue.includes(nextUrl)) {
+            queue.push(nextUrl);
+          }
         }
       }
-      chapters.push(item);
-    }
-
-    if (tocRule.nextTocUrl) {
-      const nextUrl = ctx.getString(tocRule.nextTocUrl, true);
-      if (nextUrl && nextUrl !== currentUrl && !visitedPages.has(nextUrl)) {
-        currentUrl = nextUrl;
-      } else {
-        break;
-      }
-    } else {
-      break;
     }
   }
+  if (queue.some((u) => u && !visitedPages.has(u))) truncated = true;
 
   const manifest = {
     publicationRef,
@@ -552,75 +623,124 @@ export async function fetchChapterManifest(source, meta, publicationRef, { timeo
       throw new Error(`目录过大（${chapters.length} 章），超过宿主 2MB 消息上限`);
     }
   }
+  return { manifest, truncated };
+}
+
+export async function fetchChapterManifest(source, meta, publicationRef, opts = {}) {
+  const { manifest } = await buildChapterManifest(source, meta, publicationRef, opts);
   return manifest;
 }
 
-function applyReplaceRegex(rawContent, replaceRegex) {
-  if (!replaceRegex || !rawContent) return rawContent;
-  // Apply Legado replaceRegex rules (newline-separated ##pattern##rep)
-  let out = rawContent;
-  const rules = String(replaceRegex).split('\n').map((l) => l.trim()).filter(Boolean);
-  for (const r of rules) {
-    if (r.startsWith('##')) {
-      const segs = r.slice(2).split('##');
-      try {
-        out = out.replace(new RegExp(segs[0], 'g'), segs[1] ?? '');
-      } catch {
-        // ignore bad regex
-      }
+/**
+ * Apply a Legado replaceRegex rule: one or more lines of `##pattern##replacement`
+ * (`###` suffix = replace first match only), or an @js: / <js> script.
+ */
+export function applyReplaceRegex(text, replaceRegex, ctx = null) {
+  const rule = String(replaceRegex ?? '').trim();
+  if (!rule || !text) return text;
+  if (rule.startsWith('@js:') || /^<js>[\s\S]*<\/js>$/i.test(rule)) {
+    if (!ctx) return text;
+    const code = rule.startsWith('@js:') ? rule.slice(4) : rule.replace(/^<js>/i, '').replace(/<\/js>$/i, '');
+    const out = ctx.runJs(ctx.prepareJsCode(code), text, text);
+    return out === undefined || out === null ? text : String(out);
+  }
+  let out = String(text);
+  for (const line of rule.split('\n')) {
+    const r = line.trim();
+    if (!r.startsWith('##')) continue;
+    let body = r.slice(2);
+    let onlyFirst = false;
+    if (body.endsWith('###')) {
+      onlyFirst = true;
+      body = body.slice(0, -3);
+    }
+    const idx = body.indexOf('##');
+    const pattern = idx >= 0 ? body.slice(0, idx) : body;
+    const replacement = idx >= 0 ? body.slice(idx + 2) : '';
+    if (!pattern) continue;
+    try {
+      out = out.replace(new RegExp(pattern, onlyFirst ? '' : 'g'), replacement);
+    } catch {
+      // ignore bad regex
     }
   }
   return out;
+}
+
+function normalizeTextBlocks(text) {
+  return String(text ?? '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join('\n\n');
 }
 
 /**
  * Fetch chapter content.
  * asHtml=false -> { mediaType: 'text/plain', text }
  * asHtml=true  -> { mediaType: 'text/html', text: html with reader-res images }
+ * nextContentUrl may return one URL (chain) or several (fetched concurrently).
  */
-export async function fetchChapterContent(source, chapterUrl, { timeoutMs = 12_000, signal, asHtml = false, vars = {} } = {}) {
+export async function fetchChapterContent(
+  source,
+  chapterUrl,
+  { timeoutMs = 12_000, signal, asHtml = false, vars = {}, chapter = null, maxPages = 30 } = {},
+) {
   const contentRule = source.ruleContent || {};
-  const srcBase = String(source.bookSourceUrl || '').trim();
-  let currentUrl = chapterUrl;
   const visited = new Set();
+  const queue = chapterUrl ? [chapterUrl] : [];
   const parts = [];
   const rawParts = [];
-  const maxPages = 10;
+  const limit = Math.max(1, Math.min(100, Number(maxPages) || 30));
+  const chapterInfo = { url: chapterUrl, title: chapter?.title || '', index: chapter?.index ?? 0 };
+  let lastCtx = null;
+  let pages = 0;
 
-  for (let p = 0; p < maxPages && currentUrl && !visited.has(currentUrl); p++) {
-    visited.add(currentUrl);
-    const res = await fetchLegado(currentUrl, {
-      baseUrl: srcBase,
-      sourceHeader: source.header || '',
-      timeoutMs,
-      signal,
-    });
-    assertLegadoResponse(res, 'content');
+  while (queue.length > 0 && pages < limit) {
+    const batch = takeBatch(queue, visited, Math.min(PAGE_FETCH_CONCURRENCY, limit - pages));
+    if (batch.length === 0) continue;
+    pages += batch.length;
+    const settled = await Promise.allSettled(
+      batch.map((u) => fetchLegado(u, requestOptions(source, { timeoutMs, signal, retries: 1 }))),
+    );
 
-    const ctx = new RuleContext({
-      source,
-      baseUrl: res.url || currentUrl,
-      content: res.body,
-      vars,
-    });
-
-    const rawContent = applyReplaceRegex(ctx.getString(contentRule.content), contentRule.replaceRegex);
-    if (asHtml) {
-      if (rawContent) rawParts.push({ raw: rawContent, baseUrl: res.url || currentUrl });
-    } else {
-      const cleaned = htmlToCleanText(rawContent);
-      if (cleaned) parts.push(cleaned);
-    }
-
-    if (contentRule.nextContentUrl) {
-      const nextUrl = ctx.getString(contentRule.nextContentUrl, true);
-      if (nextUrl && nextUrl !== currentUrl && !visited.has(nextUrl)) {
-        currentUrl = resolveUrl(res.url || currentUrl, nextUrl);
-      } else {
-        break;
+    for (let b = 0; b < batch.length; b++) {
+      const pageUrl = batch[b];
+      let res;
+      try {
+        if (settled[b].status === 'rejected') throw settled[b].reason;
+        res = settled[b].value;
+        assertLegadoResponse(res, 'content');
+      } catch (err) {
+        // The first page must work; a failing later page only shortens the chapter.
+        if (signal?.aborted || (parts.length === 0 && rawParts.length === 0)) throw err;
+        continue;
       }
-    } else {
-      break;
+
+      const ctx = new RuleContext({
+        source,
+        baseUrl: res.url || pageUrl,
+        content: res.body,
+        vars,
+        chapter: chapterInfo,
+      });
+      lastCtx = ctx;
+
+      const rawContent = ctx.getString(contentRule.content);
+      if (asHtml) {
+        const replaced = applyReplaceRegex(rawContent, contentRule.replaceRegex, ctx);
+        if (replaced) rawParts.push({ raw: replaced, baseUrl: res.url || pageUrl });
+      } else {
+        const cleaned = htmlToCleanText(rawContent);
+        if (cleaned) parts.push(cleaned);
+      }
+
+      if (contentRule.nextContentUrl) {
+        for (const nextUrl of ctx.getStringList(contentRule.nextContentUrl, true)) {
+          const abs = resolveUrl(res.url || pageUrl, nextUrl);
+          if (abs && abs !== pageUrl && !visited.has(abs) && !queue.includes(abs)) queue.push(abs);
+        }
+      }
     }
   }
 
@@ -632,24 +752,125 @@ export async function fetchChapterContent(source, chapterUrl, { timeoutMs = 12_0
     };
   }
 
+  // Like Legado, replaceRegex runs on the formatted text of the whole chapter.
+  let text = parts.join('\n\n');
+  if (text && contentRule.replaceRegex) {
+    text = normalizeTextBlocks(applyReplaceRegex(text, contentRule.replaceRegex, lastCtx));
+  }
   return {
     mediaType: 'text/plain',
-    text: parts.join('\n\n') || '（本章正文为空或解析失败）',
+    text: text || '（本章正文为空或解析失败）',
   };
 }
 
 // ---------------------------------------------------------------------------
 // Full-chain self test (search -> detail -> toc -> first chapter)
 // ---------------------------------------------------------------------------
-function withDeadline(promise, ms, label) {
+
+/**
+ * Run `run(signal)` with a deadline. On timeout the underlying requests are
+ * aborted too (they used to keep running in the background).
+ */
+function withDeadline(run, ms, label, parentSignal) {
+  const controller = new AbortController();
+  const onAbort = () => controller.abort(parentSignal.reason);
+  if (parentSignal) {
+    if (parentSignal.aborted) onAbort();
+    else parentSignal.addEventListener('abort', onAbort, { once: true });
+  }
   let timer;
   return Promise.race([
-    promise,
+    Promise.resolve().then(() => run(controller.signal)),
     new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`${label} 超时`)), ms);
+      timer = setTimeout(() => {
+        const err = new Error(`${label} 超时`);
+        controller.abort(err);
+        reject(err);
+      }, ms);
       timer.unref?.();
     }),
-  ]).finally(() => clearTimeout(timer));
+  ]).finally(() => {
+    clearTimeout(timer);
+    parentSignal?.removeEventListener('abort', onAbort);
+  });
+}
+
+function normTitle(s) {
+  return String(s ?? '').replace(/[\s《》「」【】()（）]/g, '').toLowerCase();
+}
+
+/** Prefer results whose title equals / contains the keyword (the first hit is often an unrelated book). */
+function pickCandidates(found, keyword, max = 2) {
+  const k = normTitle(keyword);
+  const exact = [];
+  const partial = [];
+  const rest = [];
+  for (const f of found) {
+    const t = normTitle(f.entry?.title);
+    if (k && t === k) exact.push(f);
+    else if (k && t.includes(k)) partial.push(f);
+    else rest.push(f);
+  }
+  return [...exact, ...partial, ...rest].slice(0, max);
+}
+
+function chapterHasBody(content, asHtml) {
+  const body = String(content?.text || '');
+  if (!body || body.includes('正文为空或解析失败')) return false;
+  return asHtml ? body.includes('reader-res:') || htmlToCleanText(body).length > 30 : body.length > 30;
+}
+
+async function testCandidate(source, candidate, { signal, stepTimeoutMs }) {
+  let stage = 'toc';
+  try {
+    const detailed = await withDeadline(
+      (s) => fetchBookDetail(source, candidate.meta, { timeoutMs: stepTimeoutMs, signal: s }),
+      stepTimeoutMs + 1000,
+      '详情',
+      signal,
+    );
+    // A health check only needs the first TOC pages, not a 100-page book.
+    const { manifest, truncated } = await withDeadline(
+      (s) => buildChapterManifest(source, detailed.meta, candidate.entry.ref, { timeoutMs: stepTimeoutMs, signal: s, maxTocPages: 3 }),
+      stepTimeoutMs * 2,
+      '目录',
+      signal,
+    );
+    if (!manifest.items.length) return { ok: false, stage: 'toc', message: '目录为空', chapters: 0 };
+
+    stage = 'content';
+    const asHtml = sourceUsesHtml(source);
+    const tryChapter = async (item, s) => {
+      const ch = decodeRef(item.ref) || {};
+      const content = await fetchChapterContent(source, ch.c, {
+        timeoutMs: stepTimeoutMs,
+        signal: s,
+        asHtml,
+        vars: ch.v || detailed.meta.vars || {},
+        chapter: { title: item.title, index: item.seq },
+        maxPages: 3,
+      });
+      return chapterHasBody(content, asHtml);
+    };
+    const hasBody = await withDeadline(
+      async (s) => {
+        if (await tryChapter(manifest.items[0], s)) return true;
+        // The first entry is often a notice / “作品相关” page with almost no text.
+        return manifest.items.length > 1 ? tryChapter(manifest.items[1], s) : false;
+      },
+      stepTimeoutMs * 2,
+      '正文',
+      signal,
+    );
+    if (!hasBody) {
+      return { ok: false, stage: 'content', message: '前两章正文为空', chapters: manifest.items.length, truncated };
+    }
+    return { ok: true, stage: 'ok', chapters: manifest.items.length, truncated };
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    const msg = String(err?.message || err).slice(0, 120);
+    return { ok: false, stage, message: `${stage === 'toc' ? '目录' : '正文'}失败：${msg}` };
+  }
 }
 
 /**
@@ -663,9 +884,10 @@ export async function testSourceChain(source, keyword, { signal, stepTimeoutMs =
   let found;
   try {
     found = await withDeadline(
-      searchWithSource(source, keyword, { timeoutMs: stepTimeoutMs, signal }),
+      (s) => searchWithSource(source, keyword, { timeoutMs: stepTimeoutMs, signal: s }),
       stepTimeoutMs + 1000,
       '搜索',
+      signal,
     );
   } catch (err) {
     return done({ ok: false, stage: 'search', message: `搜索失败：${String(err?.message || err).slice(0, 120)}` });
@@ -673,51 +895,35 @@ export async function testSourceChain(source, keyword, { signal, stepTimeoutMs =
   if (!found || found.length === 0) {
     return done({ ok: false, stage: 'search-empty', message: `搜索“${keyword}”无结果` });
   }
-  try {
-    const first = found[0];
-    const detailed = await withDeadline(
-      fetchBookDetail(source, first.meta, { timeoutMs: stepTimeoutMs, signal }),
-      stepTimeoutMs + 1000,
-      '详情',
-    );
-    const manifest = await withDeadline(
-      fetchChapterManifest(source, detailed.meta, first.entry.ref, { timeoutMs: stepTimeoutMs, signal }),
-      stepTimeoutMs * 2,
-      '目录',
-    );
-    if (!manifest.items.length) {
-      return done({ ok: false, stage: 'toc', message: '目录为空', results: found.length });
+
+  const candidates = pickCandidates(found, keyword, 2);
+  let last = null;
+  for (let i = 0; i < candidates.length; i++) {
+    // Only try a second book when the first one failed quickly (keeps the total time bounded).
+    if (i > 0 && Date.now() - started > stepTimeoutMs * 1.5) break;
+    let r;
+    try {
+      r = await testCandidate(source, candidates[i], { signal, stepTimeoutMs });
+    } catch (err) {
+      const msg = String(err?.message || err).slice(0, 120);
+      return done({ ok: false, stage: last?.stage || 'toc', message: `检测中止：${msg}`, results: found.length });
     }
-    const ch0 = decodeRef(manifest.items[0].ref);
-    const asHtml = sourceUsesHtml(source);
-    const content = await withDeadline(
-      fetchChapterContent(source, ch0.c, { timeoutMs: stepTimeoutMs, signal, asHtml, vars: ch0.v || detailed.meta.vars || {} }),
-      stepTimeoutMs * 2,
-      '正文',
-    );
-    const body = String(content.text || '');
-    const hasBody = asHtml
-      ? body.includes('reader-res:') || htmlToCleanText(body).length > 30
-      : body.length > 30;
-    if (!hasBody || body.includes('正文为空或解析失败')) {
+    if (r.ok) {
       return done({
-        ok: false,
-        stage: 'content',
-        message: '第一章正文为空',
+        ok: true,
+        stage: 'ok',
+        message: `搜索 ${found.length} 条，目录 ${r.chapters}${r.truncated ? '+' : ''} 章`,
         results: found.length,
-        chapters: manifest.items.length,
+        chapters: r.chapters,
       });
     }
-    return done({
-      ok: true,
-      stage: 'ok',
-      message: `搜索 ${found.length} 条，目录 ${manifest.items.length} 章`,
-      results: found.length,
-      chapters: manifest.items.length,
-    });
-  } catch (err) {
-    const msg = String(err?.message || err).slice(0, 120);
-    const stage = /正文/.test(msg) ? 'content' : 'toc';
-    return done({ ok: false, stage, message: `${stage === 'toc' ? '目录' : '正文'}失败：${msg}`, results: found.length });
+    last = r;
   }
+  return done({
+    ok: false,
+    stage: last.stage,
+    message: last.message,
+    results: found.length,
+    ...(last.chapters ? { chapters: last.chapters } : {}),
+  });
 }

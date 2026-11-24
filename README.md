@@ -20,7 +20,7 @@
 
 ## 安装 / 升级
 
-1. 在项目目录执行 `npm install --registry=https://registry.npmmirror.com` 后 `npm pack`，得到 `reader-plugin-legado-0.4.0.tgz`（或从 Releases 下载）。
+1. 在项目目录执行 `npm install --registry=https://registry.npmmirror.com` 后 `npm pack`，得到 `reader-plugin-legado-0.4.2.tgz`（或从 Releases 下载）。
 2. 在 `reader-pro` 管理员后台「插件管理」上传 `.tgz` 并勾选信任安装（升级时选择替换）。已导入的书源保存在插件数据目录，升级不会丢失。
 3. 首次安装时在「书源管理」中新增 `Legado JSON 书源` 实例。
 4. 打开插件的 **`Legado 书源管理`** 页面导入书源 JSON（仓库内附带 84 条实测全链路可用书源 `verified-e2e-sources.json`）。

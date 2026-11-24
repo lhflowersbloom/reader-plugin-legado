@@ -174,6 +174,145 @@ function buildRhinoShim() {
 }
 const RHINO_SHIM = buildRhinoShim();
 
+// ---------------------------------------------------------------------------
+// Cross-stage script state (Legado keeps these per source / per app)
+// ---------------------------------------------------------------------------
+const SOURCE_VARS = new Map(); // bookSourceUrl -> source.getVariable() value
+const JS_CACHE = new Map(); // cache.put/get: key -> { value, expires }
+const MEM_CACHE = new Map(); // cache.putMemory/getFromMemory: key -> raw value
+const JS_CACHE_MAX = 500;
+
+function boundedSet(map, key, value, max = JS_CACHE_MAX) {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > max) map.delete(map.keys().next().value);
+}
+
+function jsCachePut(key, value, saveSeconds) {
+  const secs = Number(saveSeconds) || 0;
+  boundedSet(JS_CACHE, String(key), {
+    value: value === undefined || value === null ? '' : String(value),
+    expires: secs > 0 ? Date.now() + secs * 1000 : 0,
+  });
+}
+
+/** Legado's cache.get returns null for a missing / expired key. */
+function jsCacheGet(key) {
+  const k = String(key);
+  const rec = JS_CACHE.get(k);
+  if (!rec) return null;
+  if (rec.expires && rec.expires <= Date.now()) {
+    JS_CACHE.delete(k);
+    return null;
+  }
+  return rec.value;
+}
+
+const JS_CACHE_API = {
+  put: (k, v, t) => {
+    jsCachePut(k, v, t);
+    return v;
+  },
+  get: (k) => jsCacheGet(k),
+  delete: (k) => {
+    JS_CACHE.delete(String(k));
+  },
+  putMemory: (k, v) => {
+    boundedSet(MEM_CACHE, String(k), v);
+    return v;
+  },
+  getFromMemory: (k) => (MEM_CACHE.has(String(k)) ? MEM_CACHE.get(String(k)) : null),
+  deleteMemory: (k) => {
+    MEM_CACHE.delete(String(k));
+  },
+};
+
+/** jsLib may be plain JS or a JSON map of remote libraries (unsupported): only run plain JS. */
+function jsLibCode(source) {
+  const lib = String(source?.jsLib ?? '').trim();
+  if (!lib) return '';
+  if (lib.startsWith('{')) {
+    try {
+      JSON.parse(lib);
+      return '';
+    } catch {
+      // not JSON: treat as code
+    }
+  }
+  return lib;
+}
+
+// Plain scripts get 5 s. Scripts doing blocking HTTP (java.ajax / java.get(url) / java.post ...)
+// spend that time waiting on the network, so they get 20 s (群小说网 fetches its homepage for a token in ~5–6 s).
+export const JS_TIMEOUT_MS = 5000;
+export const JS_NET_TIMEOUT_MS = 20_000;
+const JS_NET_RE = /\bjava\s*\.\s*(ajax|ajaxAll|get|post|connect)\s*\(/;
+
+export function jsTimeoutFor(code) {
+  return JS_NET_RE.test(String(code ?? '')) ? JS_NET_TIMEOUT_MS : JS_TIMEOUT_MS;
+}
+
+const GET_BYTES_POLYFILL =
+  'if (!String.prototype.getBytes) { Object.defineProperty(String.prototype, "getBytes", { value: function(cs) { return __strToBytes(this, cs); }, configurable: true }); }';
+
+function jsStaticGlobals() {
+  return {
+    org: {
+      jsoup: {
+        Jsoup: {
+          parse(html) {
+            const $ = cheerio.load(String(html ?? ''));
+            return wrapCheerioEl($, $.root()[0]);
+          },
+        },
+      },
+    },
+    Packages: RHINO_SHIM.Packages,
+    JavaImporter: RHINO_SHIM.JavaImporter,
+    cache: JS_CACHE_API,
+    __strToBytes: (s, cs) => {
+      const enc = cs ? String(cs).toLowerCase() : 'utf-8';
+      return enc !== 'utf-8' && enc !== 'utf8' && iconv.encodingExists(enc)
+        ? iconv.encode(String(s ?? ''), enc)
+        : Buffer.from(String(s ?? ''), 'utf8');
+    },
+    Buffer,
+    encodeURIComponent,
+    decodeURIComponent,
+    encodeURI,
+    decodeURI,
+    console: { log() {}, warn() {}, error() {} },
+  };
+}
+
+// Book source `header` may itself be a script (@js: / <js>) returning a JSON object.
+const HEADER_CACHE = new Map();
+const HEADER_TTL_MS = 10 * 60_000;
+
+/** Resolve a source's header to a JSON string (scripts are evaluated and cached for 10 minutes). */
+export function resolveSourceHeader(source) {
+  const raw = String(source?.header ?? '').trim();
+  if (!raw) return '';
+  const isJs = raw.startsWith('@js:') || /^<js>[\s\S]*<\/js>$/i.test(raw);
+  if (!isJs) return raw;
+  const cacheKey = `${source.bookSourceUrl || ''}\n${raw}`;
+  const hit = HEADER_CACHE.get(cacheKey);
+  if (hit && Date.now() - hit.at < HEADER_TTL_MS) return hit.value;
+  const code = raw.startsWith('@js:') ? raw.slice(4) : raw.replace(/^<js>/i, '').replace(/<\/js>$/i, '');
+  let value = '';
+  try {
+    // header: '' prevents the script's own java.ajax calls from recursing into this resolver.
+    const ctx = new RuleContext({ source: { ...source, header: '' }, baseUrl: source.bookSourceUrl || '', content: '' });
+    const out = ctx.runJs(ctx.prepareJsCode(code), '', '');
+    value = out && typeof out === 'object' ? JSON.stringify(out) : String(out ?? '').trim();
+  } catch {
+    value = '';
+  }
+  if (!value.startsWith('{')) value = '';
+  boundedSet(HEADER_CACHE, cacheKey, { value, at: Date.now() }, 200);
+  return value;
+}
+
 function md5Hex(input) {
   return crypto.createHash('md5').update(String(input ?? ''), 'utf8').digest('hex');
 }
@@ -690,8 +829,11 @@ function evalXPathRule(content, ruleStr, returnElements = false) {
 }
 
 export class RuleContext {
-  constructor({ source, baseUrl = '', content = '', vars = {}, book = {}, key = '', page = 1 }) {
+  constructor({ source, baseUrl = '', content = '', vars = {}, book = {}, key = '', page = 1, chapter = null, jsHost = null }) {
     this.source = source || {};
+    this.chapter = chapter;
+    // Shared (per root context) JS VM so jsLib is compiled once, not once per rule call.
+    this._jsHost = jsHost || {};
     this.baseUrl = baseUrl || source?.bookSourceUrl || '';
     this.content = content;
     this.vars = { ...vars };
@@ -710,6 +852,8 @@ export class RuleContext {
       book: overrides.book ?? this.book,
       key: overrides.key ?? this.key,
       page: overrides.page ?? this.page,
+      chapter: overrides.chapter ?? this.chapter,
+      jsHost: this._jsHost,
     });
     next._sourceVar = this._sourceVar;
     return next;
@@ -717,12 +861,21 @@ export class RuleContext {
 
   buildSourceProxy() {
     const self = this;
+    const srcKey = String(self.source?.bookSourceUrl || '');
     return {
       ...this.source,
-      getKey: () => String(self.source?.bookSourceUrl || ''),
+      getKey: () => srcKey,
       getTag: () => String(self.source?.bookSourceName || self.source?.bookSourceUrl || ''),
-      getVariable: () => self._sourceVar || '',
-      setVariable: (v) => { self._sourceVar = String(v ?? ''); },
+      getVariable: () => (SOURCE_VARS.has(srcKey) ? SOURCE_VARS.get(srcKey) : self._sourceVar || ''),
+      setVariable: (v) => {
+        self._sourceVar = String(v ?? '');
+        if (srcKey) boundedSet(SOURCE_VARS, srcKey, self._sourceVar);
+      },
+      put: (k, v) => {
+        jsCachePut(`${srcKey}::${k}`, v, 0);
+        return v;
+      },
+      get: (k) => jsCacheGet(`${srcKey}::${k}`) ?? '',
       getLoginInfoMap: () => ({}),
       getLoginHeader: () => self.source?.header || '',
     };
@@ -742,7 +895,7 @@ export class RuleContext {
             : String(k);
           const res = syncFetchLegado(optUrl, {
             baseUrl: self.baseUrl,
-            sourceHeader: self.source.header,
+            sourceHeader: resolveSourceHeader(self.source),
           });
           return {
             body: () => res.body,
@@ -758,7 +911,7 @@ export class RuleContext {
         const optUrl = `${url},${JSON.stringify({ method: 'POST', body: String(body ?? ''), headers: headers || {} })}`;
         const res = syncFetchLegado(optUrl, {
           baseUrl: self.baseUrl,
-          sourceHeader: self.source.header,
+          sourceHeader: resolveSourceHeader(self.source),
         });
         return {
           body: () => res.body,
@@ -772,7 +925,7 @@ export class RuleContext {
         const target = Array.isArray(url) ? url[0] : url;
         const res = syncFetchLegado(String(target), {
           baseUrl: self.baseUrl,
-          sourceHeader: self.source.header,
+          sourceHeader: resolveSourceHeader(self.source),
         });
         return res.body || '';
       },
@@ -780,7 +933,7 @@ export class RuleContext {
         const optUrl = header ? `${url},${JSON.stringify({ headers: header })}` : String(url);
         const res = syncFetchLegado(optUrl, {
           baseUrl: self.baseUrl,
-          sourceHeader: self.source.header,
+          sourceHeader: resolveSourceHeader(self.source),
         });
         return {
           body: () => res.body,
@@ -813,8 +966,16 @@ export class RuleContext {
       md5Encode16(str) {
         return md5Hex(str).slice(8, 24);
       },
-      base64Decode(str) {
-        return Buffer.from(String(str ?? ''), 'base64').toString('utf8');
+      base64Decode(str, charset) {
+        const buf = Buffer.from(String(str ?? ''), 'base64');
+        const cs = typeof charset === 'string' ? charset.toLowerCase() : 'utf-8';
+        return cs !== 'utf-8' && cs !== 'utf8' && iconv.encodingExists(cs) ? iconv.decode(buf, cs) : buf.toString('utf8');
+      },
+      hexEncodeToString(str) {
+        return Buffer.from(String(str ?? ''), 'utf8').toString('hex');
+      },
+      hexDecodeToByteArray(hex) {
+        return [...Buffer.from(String(hex ?? ''), 'hex')].map((b) => (b > 127 ? b - 256 : b));
       },
       base64Encode(str) {
         return Buffer.from(String(str ?? ''), 'utf8').toString('base64');
@@ -934,7 +1095,7 @@ export class RuleContext {
       ajaxAll(urls) {
         const list = Array.isArray(urls) ? urls : [urls];
         return list.map((u) => {
-          const res = syncFetchLegado(String(u), { baseUrl: self.baseUrl, sourceHeader: self.source.header });
+          const res = syncFetchLegado(String(u), { baseUrl: self.baseUrl, sourceHeader: resolveSourceHeader(self.source) });
           return {
             body: () => res.body,
             url: () => res.url,
@@ -955,45 +1116,46 @@ export class RuleContext {
       toNumChapter(str) {
         return toNumChapter(str);
       },
-      log() {},
+      log(msg) {
+        return msg;
+      },
       toast() {},
       longToast() {},
     };
   }
 
-  runJs(code, result, fallbackOnErr = result) {
+  /** Per-call globals (bound to this context). */
+  buildJsEnv(result) {
+    const self = this;
     const java = this.buildJavaApi();
-    const decoratedResult = Array.isArray(result) ? decorateElementsArray(result) : result;
-    const jsoupShim = {
-      parse(html) {
-        const $ = cheerio.load(String(html ?? ''));
-        return wrapCheerioEl($, $.root()[0]);
-      },
-    };
     const bookProxy = {
       origin: this.source?.bookSourceUrl || '',
+      ...this.book,
+      getVariable: (k) => (k === undefined || k === null ? self.vars.__bookVariable || '' : self.vars[String(k)] ?? ''),
+      putVariable: (k, v) => {
+        if (v === undefined) self.vars.__bookVariable = String(k ?? '');
+        else self.vars[String(k)] = v === null ? '' : String(v);
+      },
+    };
+    const chapterProxy = {
+      title: '',
+      url: '',
+      index: 0,
+      ...(this.chapter || {}),
       getVariable: () => '',
       putVariable: () => {},
-      ...this.book,
     };
-    const sandbox = {
+    return {
       java,
-      result: decoratedResult,
+      result: Array.isArray(result) ? decorateElementsArray(result) : result,
       baseUrl: this.baseUrl,
       src: this.content,
       book: bookProxy,
+      chapter: chapterProxy,
+      title: chapterProxy.title || '',
       source: this.buildSourceProxy(),
       key: this.key,
       page: this.page,
-      org: { jsoup: { Jsoup: jsoupShim } },
-      Packages: RHINO_SHIM.Packages,
-      JavaImporter: RHINO_SHIM.JavaImporter,
-      __strToBytes: (s, cs) => {
-        const enc = cs ? String(cs).toLowerCase() : 'utf-8';
-        return enc !== 'utf-8' && enc !== 'utf8' && iconv.encodingExists(enc)
-          ? iconv.encode(String(s ?? ''), enc)
-          : Buffer.from(String(s ?? ''), 'utf8');
-      },
       cookie: {
         getCookie: (url) => getCookieForUrl(url || this.baseUrl),
         getKey: (url, k) => java.getCookie(url, k),
@@ -1001,25 +1163,67 @@ export class RuleContext {
         replaceCookie: (url, value) => setCookieString(url || this.baseUrl, value),
         removeCookie: (url) => removeCookie(url || this.baseUrl),
       },
-      Buffer,
-      encodeURIComponent,
-      decodeURIComponent,
-      encodeURI,
-      decodeURI,
-      console: { log() {}, warn() {}, error() {} },
     };
+  }
+
+  /** Lazily create the shared VM context (globals + getBytes polyfill + jsLib, once). */
+  getJsContext() {
+    const host = this._jsHost;
+    if (host.ctx) return host.ctx;
+    const sandbox = jsStaticGlobals();
+    const ctx = vm.createContext(sandbox);
+    vm.runInContext(GET_BYTES_POLYFILL, ctx, { timeout: 1000 });
+    const lib = jsLibCode(this.source);
+    if (lib) {
+      try {
+        vm.runInContext(lib, ctx, { timeout: jsTimeoutFor(lib) });
+      } catch {
+        // a broken jsLib only breaks the scripts that use it
+      }
+    }
+    host.sandbox = sandbox;
+    host.ctx = ctx;
+    return ctx;
+  }
+
+  /** Legacy path: fresh VM context for one script (used for nested calls and as fallback). */
+  runJsIsolated(code, result, fallbackOnErr = result) {
+    const sandbox = { ...jsStaticGlobals(), ...this.buildJsEnv(result) };
     const ctx = vm.createContext(sandbox);
     try {
-      vm.runInContext(
-        'if (!String.prototype.getBytes) { Object.defineProperty(String.prototype, "getBytes", { value: function(cs) { return __strToBytes(this, cs); }, configurable: true }); }',
-        ctx,
-        { timeout: 1000 },
-      );
-      const jsLib = this.source?.jsLib ? `${this.source.jsLib}\n` : '';
-      const out = vm.runInContext(`${jsLib}${code}`, ctx, { timeout: 5000 });
+      vm.runInContext(GET_BYTES_POLYFILL, ctx, { timeout: 1000 });
+      const lib = jsLibCode(this.source);
+      const out = vm.runInContext(`${lib ? `${lib}\n` : ''}${code}`, ctx, { timeout: jsTimeoutFor(code) });
       return out !== undefined ? out : sandbox.result;
     } catch {
       return fallbackOnErr;
+    }
+  }
+
+  runJs(code, result, fallbackOnErr = result) {
+    const host = this._jsHost;
+    // A script calling java.getString(...) can re-enter here: never clobber the running script's globals.
+    if (host.busy) return this.runJsIsolated(code, result, fallbackOnErr);
+    let ctx;
+    try {
+      ctx = this.getJsContext();
+    } catch {
+      return this.runJsIsolated(code, result, fallbackOnErr);
+    }
+    Object.assign(host.sandbox, this.buildJsEnv(result));
+    host.busy = true;
+    try {
+      // Block wrapper: let/const stay local to this call, completion value is kept.
+      const out = vm.runInContext(`{\n${code}\n}`, ctx, { timeout: jsTimeoutFor(code) });
+      return out !== undefined ? out : host.sandbox.result;
+    } catch (err) {
+      if (err && err.name === 'SyntaxError') {
+        host.busy = false;
+        return this.runJsIsolated(code, result, fallbackOnErr);
+      }
+      return fallbackOnErr;
+    } finally {
+      host.busy = false;
     }
   }
 
