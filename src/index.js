@@ -1,3 +1,4 @@
+import './harden.js';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import {
@@ -887,15 +888,30 @@ async function renderManagePage(dataDir, userId, { notice, noticeKind, activeTab
   return page;
 }
 
-function withTimeout(promise, ms, message) {
+/**
+ * Run `run(signal)` with a deadline; on timeout the work is aborted too, so a
+ * timed-out single check does not keep requesting in the background.
+ */
+function withTimeout(run, ms, message, parentSignal) {
+  const controller = new AbortController();
+  const onAbort = () => controller.abort(parentSignal?.reason);
+  if (parentSignal?.aborted) onAbort();
+  else parentSignal?.addEventListener('abort', onAbort, { once: true });
   let timer;
   return Promise.race([
-    promise,
+    Promise.resolve().then(() => run(controller.signal)),
     new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(message)), ms);
+      timer = setTimeout(() => {
+        const err = new Error(message);
+        controller.abort(err);
+        reject(err);
+      }, ms);
       timer.unref?.();
     }),
-  ]).finally(() => clearTimeout(timer));
+  ]).finally(() => {
+    clearTimeout(timer);
+    parentSignal?.removeEventListener('abort', onAbort);
+  });
 }
 
 async function handleExtensionAction(params, signal) {
@@ -969,9 +985,10 @@ async function handleExtensionAction(params, signal) {
       try {
         r = await withTimeout(
           // Single checks must finish within the 24 s action budget.
-          testSourceChain(src, keyword, { signal, stepTimeoutMs: Math.min(getSettings().searchTimeoutMs || SEARCH_TIMEOUT_MS, 8000) }),
+          (s) => testSourceChain(src, keyword, { signal: s, stepTimeoutMs: Math.min(getSettings().searchTimeoutMs || SEARCH_TIMEOUT_MS, 8000) }),
           24_000,
           '检测超过 24 秒，已中止（可在“测活”页用后台检测）',
+          signal,
         );
       } catch (err) {
         r = { ok: false, stage: 'search', message: errMessage(err), ms: 24_000 };
@@ -1190,7 +1207,30 @@ rl.on('line', (line) => {
   }
   void dispatch(msg);
 });
-rl.on('close', () => {
-  // Host closed stdin: persist pending caches before exiting.
-  Promise.allSettled([flushStorage(), flushCookies()]).finally(() => process.exit(0));
+
+// ---------------------------------------------------------------------------
+// Shutdown / crash handling: always persist the debounced caches (health 3 s,
+// cookies 1.5 s, metadata 10 s) before the process goes away.
+// ---------------------------------------------------------------------------
+let exiting = false;
+function shutdown(code) {
+  if (exiting) return;
+  exiting = true;
+  const hardStop = setTimeout(() => process.exit(code), 3000);
+  hardStop.unref?.();
+  Promise.allSettled([flushStorage(), flushCookies()]).finally(() => process.exit(code));
+}
+
+// Host closed stdin: persist pending caches before exiting.
+rl.on('close', () => shutdown(0));
+process.on('SIGTERM', () => shutdown(0));
+process.on('SIGINT', () => shutdown(0));
+
+// A stray rejected promise (e.g. from a book-source script) must not kill the plugin.
+process.on('unhandledRejection', (reason) => {
+  process.stderr.write(`[legado] unhandledRejection: ${String(reason?.stack || reason).slice(0, 2000)}\n`);
+});
+process.on('uncaughtException', (err) => {
+  process.stderr.write(`[legado] uncaughtException: ${String(err?.stack || err).slice(0, 2000)}\n`);
+  shutdown(1);
 });

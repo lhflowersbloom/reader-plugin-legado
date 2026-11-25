@@ -479,13 +479,75 @@ export async function fetchLegado(rawUrl, options = {}) {
   }
 }
 
+// Redirects are followed by hand so that Set-Cookie headers of intermediate
+// 3xx responses (login / anti-bot hops) reach the cookie jar, like OkHttp's
+// CookieJar does in Legado.
+const MAX_REDIRECTS = 10;
+const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
+// Text responses larger than this are rejected instead of exhausting memory.
+export const DEFAULT_MAX_TEXT_BYTES = 16 * 1024 * 1024;
+
+/** Read a response body, aborting once it exceeds `maxBytes` (0 = unlimited). */
+async function readBodyLimited(res, maxBytes) {
+  const declared = Number(res.headers.get('content-length')) || 0;
+  if (maxBytes && declared > maxBytes) {
+    throw new Error(`RESPONSE_TOO_LARGE (${declared} bytes)`);
+  }
+  const stream = res.body;
+  if (!stream || typeof stream.getReader !== 'function') {
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (maxBytes && buf.length > maxBytes) throw new Error(`RESPONSE_TOO_LARGE (${buf.length} bytes)`);
+    return buf;
+  }
+  const reader = stream.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (maxBytes && total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw new Error(`RESPONSE_TOO_LARGE (>${maxBytes} bytes)`);
+    }
+    chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
+  }
+  return Buffer.concat(chunks, total);
+}
+
+/** Merge request Cookie strings; later sources win on duplicate names. */
+function mergeCookieHeaders(...sources) {
+  const merged = new Map();
+  for (const src of sources) {
+    for (const part of String(src || '').split(';')) {
+      const eq = part.indexOf('=');
+      if (eq <= 0) continue;
+      const name = part.slice(0, eq).trim();
+      if (!name) continue;
+      merged.set(name, part.slice(eq + 1).trim());
+    }
+  }
+  return [...merged.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+function discardBody(res) {
+  try {
+    const p = res.body?.cancel?.();
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+  } catch {
+    // ignore
+  }
+}
+
 /**
- * Fetch a Legado-style URL once.
+ * Fetch a Legado-style URL once (following redirects by hand).
  *
- * options.cookieHeader: Cookie header to send instead of looking up the jar
- *   (the sync-fetch worker uses this, because its jar is not the real one).
+ * options.cookieHeader: Cookie header to send on the first hop instead of
+ *   looking up the jar (the sync-fetch worker uses this, because its jar is not
+ *   the real one).
  * options.binary: return the raw Buffer in `buffer` and skip text decoding.
- * options.maxBytes: abort bodies larger than this (binary downloads).
+ * options.maxBytes: abort bodies larger than this (default 16 MiB for text,
+ *   unlimited for binary unless given).
  */
 async function fetchLegadoOnce(rawUrl, options = {}) {
   const {
@@ -503,12 +565,14 @@ async function fetchLegadoOnce(rawUrl, options = {}) {
   if (!parsed.url || !/^https?:\/\//i.test(parsed.url)) {
     throw new Error(`Invalid URL: ${parsed.url}`);
   }
+  const byteLimit = maxBytes || (binary ? 0 : DEFAULT_MAX_TEXT_BYTES);
 
   const headers = sanitizeHeaders({ ...parsed.headers, ...(extraHeaders || {}) });
-  const existingCookie = cookieHeader !== undefined ? cookieHeader : getCookieForUrl(parsed.url);
-  if (existingCookie && !hasHeader(headers, 'cookie')) {
-    headers.Cookie = existingCookie;
-  }
+  // A Cookie header written by the book source itself is only sent to the original host.
+  const userCookieKey = Object.keys(headers).find((k) => k.toLowerCase() === 'cookie');
+  const userCookie = userCookieKey ? headers[userCookieKey] : '';
+  if (userCookieKey) delete headers[userCookieKey];
+  const firstHost = hostOf(parsed.url);
 
   let bodyBuf;
   if (parsed.method !== 'GET' && parsed.method !== 'HEAD' && parsed.body !== undefined) {
@@ -533,34 +597,69 @@ async function fetchLegadoOnce(rawUrl, options = {}) {
   signal?.addEventListener('abort', onAbort, { once: true });
 
   try {
-    const res = await fetch(parsed.url, {
-      method: parsed.method,
-      headers,
-      body: bodyBuf,
-      redirect: 'follow',
-      signal: controller.signal,
-    });
-
-    const setCookies = typeof res.headers.getSetCookie === 'function'
-      ? res.headers.getSetCookie()
-      : [];
-    setCookieForUrl(res.url || parsed.url, setCookies);
-
-    const declared = Number(res.headers.get('content-length')) || 0;
-    if (maxBytes && declared > maxBytes) {
-      throw new Error(`RESPONSE_TOO_LARGE (${declared} bytes)`);
+    let url = parsed.url;
+    let method = parsed.method;
+    let body = bodyBuf;
+    let res;
+    const cookieHops = []; // [{ url, setCookies }] for callers whose jar is elsewhere (sync worker)
+    let setCookies = [];
+    for (let hop = 0; ; hop++) {
+      const hopHeaders = { ...headers };
+      const sameHost = hostOf(url) === firstHost;
+      const jarCookie = getCookieForUrl(url);
+      // The sync worker passes the main jar's Cookie header for the first hop
+      // because its own jar is empty. Keep that header on same-host redirects,
+      // merged with cookies the intermediate hops set.
+      let hopCookie = hop === 0 && cookieHeader !== undefined ? cookieHeader : jarCookie;
+      if (hop > 0 && sameHost && cookieHeader !== undefined) {
+        hopCookie = mergeCookieHeaders(cookieHeader, jarCookie);
+      }
+      // A Cookie header written by the book source itself is only sent to the
+      // original host, but later hops still need the cookies set by the redirect.
+      if (userCookie && sameHost) {
+        hopCookie = hop === 0 ? userCookie : mergeCookieHeaders(userCookie, jarCookie);
+      }
+      if (hopCookie) hopHeaders.Cookie = hopCookie;
+      res = await fetch(url, {
+        method,
+        headers: hopHeaders,
+        body,
+        redirect: 'manual',
+        signal: controller.signal,
+      });
+      const resUrl = res.url || url;
+      setCookies = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
+      if (setCookies.length > 0) {
+        setCookieForUrl(resUrl, setCookies);
+        cookieHops.push({ url: resUrl, setCookies });
+      }
+      const location = REDIRECT_STATUS.has(res.status) ? res.headers.get('location') : null;
+      if (!location || hop >= MAX_REDIRECTS) break;
+      let next;
+      try {
+        next = new URL(location, resUrl).href;
+      } catch {
+        break;
+      }
+      if (!/^https?:\/\//i.test(next)) break;
+      discardBody(res);
+      // Browser semantics: 303 always, and 301/302 after POST, continue as GET without a body.
+      if (res.status === 303 || ((res.status === 301 || res.status === 302) && method === 'POST')) {
+        if (method !== 'HEAD') method = 'GET';
+        body = undefined;
+        for (const k of Object.keys(headers)) if (k.toLowerCase() === 'content-type') delete headers[k];
+      }
+      url = next;
     }
-    const arrBuf = await res.arrayBuffer();
-    const buf = Buffer.from(arrBuf);
-    if (maxBytes && buf.length > maxBytes) {
-      throw new Error(`RESPONSE_TOO_LARGE (${buf.length} bytes)`);
-    }
+
+    const buf = await readBodyLimited(res, byteLimit);
 
     const base = {
-      url: res.url || parsed.url,
+      url: res.url || url,
       status: res.status,
       headers: Object.fromEntries(res.headers.entries()),
       setCookies,
+      cookieHops,
     };
     if (binary) return { ...base, buffer: buf };
 

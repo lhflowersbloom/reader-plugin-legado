@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.4.4 (2026-11-25)
+
+### 修复
+- **重定向中间跳的 Cookie 丢失**：改为手动跟随重定向（最多 10 跳），每一跳的 `Set-Cookie` 都写入 Cookie 罐，下一跳按目标域名重新带 Cookie；同域跳转会把原始 Cookie 与跳转中新增的 Cookie 合并（`mergeCookieHeaders`），书源自己写的 `Cookie` 头只发给原始域名，不会随跨域跳转泄漏。POST 遇到 301/302/303 时按浏览器语义改为不带请求体的 GET（303 一律改 GET），307/308 保留原方法和请求体。
+- **同步请求（`java.ajax` / `java.get` 等）超过共享缓冲区时返回被截断的 JSON 文本当正文**：现在返回明确的 `SYNC_RESPONSE_TOO_LARGE`，并在下载阶段按缓冲区大小限流；JSON 解析失败返回 `SYNC_FETCH_BAD_RESPONSE`；多跳重定向的 Cookie 通过 `cookieHops` 按各自域名合并回主线程。
+- **单个书源“立即测活”（test-one）超时后请求仍在后台继续**：`withTimeout` 改为接收 `AbortSignal`，超时时真正中止底层请求。
+- **`java.getCookie(url, key)` 的 key 含 `.`、`+`、`(` 等字符时匹配错误或抛错**：对 key 做正则转义，按字面匹配。
+
+### 稳定性与安全
+- **文本响应默认上限 16 MiB**（`readBodyLimited` 流式读取，超出即中止），避免异常大响应耗尽内存。
+- **进程加固（`src/harden.js`）**：书源脚本运行在 `node:vm` 中，而 vm 不是安全边界。插件启动时禁用 `process.getBuiltinModule` / `binding` / `_linkedBinding` / `dlopen`，即使脚本逃逸也无法读写文件或执行命令（仍可联网、读取环境变量）。
+- **退出与崩溃时落盘**：收到 `SIGTERM` / `SIGINT` 或未捕获异常（`uncaughtException`）时，先写盘测活记录、Cookie 和元数据缓存再退出；游离的 Promise 拒绝（`unhandledRejection`）只记日志，不再让插件进程崩溃。
+
+### 性能
+- **cheerio 解析缓存**：同一页面被多条规则连续查询时复用已解析的 DOM（最近 6 个页面，单页上限 2 MiB），详情页和搜索结果列表不再按每个字段重复解析整页 HTML。
+
+### 测试
+- 新增 `test/unit-v044.mjs`（6 组），`package.json` 增加 `npm test` 一键串行跑全部单元测试。
+
+### 验证
+- `npm test`：5 个测试文件共 **36/36** 通过（v040 8、v041 8、v042 4、v043 10、v044 6）。
+- 软路由同窗口全链路测活（已启用 161 个书源，其中 159 个有 `searchUrl` 可测；超时 15s、并发 4）：0.4.3 通过 116，0.4.4-rc.1 通过 **119**；**0 个真实退化**。1 个 0.4.3 通过源在 rc.1 首测失败，复测时 0.4.3 与 rc.1 同时失败，判定站点抖动；1 个 0.4.3 空结果源在 rc.1 首测报错，复测恢复为空。
+- 搜索冒烟：15 个源首搜“凡人修仙传”，**19 条结果，848ms，0 报错**（0.4.3 对照 986ms / 19 条）。
+
+### 已知限制
+- **同步请求跨域跳转**：sync worker 有独立 Cookie 罐，主线程 Cookie 无法预先带入跨域目标；同域跳转与中间跳 `Set-Cookie` 已合并。
+- **vm 不是安全边界**：进程加固移除了 `process.getBuiltinModule` / `binding` / `_linkedBinding` / `dlopen`，逃逸脚本仍可联网、读取 `process.env`。
+- **同步文本上限**：共享缓冲区 4 MiB，扣除 JSON 信封与转义余量后，`java.ajax` 等单次文本响应实际约 **3.75 MiB**。
+
 ## 0.4.3 (2026-11-25)
 
 ### 修复

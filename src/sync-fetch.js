@@ -65,9 +65,14 @@ export function syncFetchLegado(rawUrl, options = {}) {
   try {
     res = JSON.parse(text);
   } catch {
-    return { url: rawUrl, status: 200, headers: {}, body: text };
+    return { url: rawUrl, status: 0, headers: {}, body: '', error: 'SYNC_FETCH_BAD_RESPONSE' };
   }
-  if (Array.isArray(res?.setCookies) && res.setCookies.length > 0) {
+  // Merge cookies of every hop (redirects may set cookies on other hosts) into the real jar.
+  if (Array.isArray(res?.cookieHops) && res.cookieHops.length > 0) {
+    for (const hop of res.cookieHops) {
+      if (hop && Array.isArray(hop.setCookies)) setCookieForUrl(hop.url || res.url || rawUrl, hop.setCookies);
+    }
+  } else if (Array.isArray(res?.setCookies) && res.setCookies.length > 0) {
     setCookieForUrl(res.url || rawUrl, res.setCookies);
   }
   return res;

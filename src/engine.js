@@ -710,9 +710,29 @@ function cssSelectSafe($, root, selector) {
   return els;
 }
 
+// One page is usually queried by many rules in a row (name, author, intro, cover,
+// tocUrl ... or every field of a list item). Keep the last few parsed documents
+// so the same HTML is not re-parsed for each rule. evalCssRule never mutates $.
+const CHEERIO_CACHE = new Map(); // html -> $
+const CHEERIO_CACHE_MAX = 6;
+const CHEERIO_CACHE_MAX_LEN = 2 * 1024 * 1024;
+
+function loadCheerioCached(html) {
+  if (html.length > CHEERIO_CACHE_MAX_LEN) return cheerio.load(html);
+  const hit = CHEERIO_CACHE.get(html);
+  if (hit) {
+    CHEERIO_CACHE.delete(html);
+    CHEERIO_CACHE.set(html, hit);
+    return hit;
+  }
+  const $ = cheerio.load(html);
+  boundedSet(CHEERIO_CACHE, html, $, CHEERIO_CACHE_MAX);
+  return $;
+}
+
 function evalCssRule(content, ruleStr, returnElements = false) {
   const html = typeof content === 'string' ? content : (content?.outerHtml ? content.outerHtml() : String(content ?? ''));
-  const $ = cheerio.load(html);
+  const $ = loadCheerioCached(html);
   const raw = ruleStr.trim();
 
   if (raw.startsWith('@css:')) {
@@ -1200,7 +1220,8 @@ export class RuleContext {
       getCookie(tag, key) {
         const all = getCookieForUrl(tag || self.baseUrl);
         if (!key) return all;
-        const m = new RegExp(`(?:^|;\\s*)${key}=([^;]*)`).exec(all);
+        const safeKey = String(key).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const m = new RegExp(`(?:^|;\\s*)${safeKey}=([^;]*)`).exec(all);
         return m ? m[1] : '';
       },
       removeCookie(tag) {
