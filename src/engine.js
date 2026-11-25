@@ -55,19 +55,78 @@ function toNodeBytes(input) {
   return Buffer.from(String(input ?? ''), 'utf8');
 }
 
+/**
+ * OpenSSL 3 disables single-DES (`des-cbc` / `des-ecb`) in the default provider,
+ * whereas Triple-DES EDE with K1=K2=K3=K8 is mathematically identical to single-DES
+ * and works natively on Node 22/24 without `--openssl-legacy-provider`.
+ */
+function normalizeDesKeyAndAlg(algBase, blockMode, rawKey) {
+  if (algBase === 'DES') {
+    const k8 = Buffer.alloc(8);
+    rawKey.copy(k8, 0, 0, Math.min(8, rawKey.length));
+    return {
+      alg: blockMode === 'ECB' ? 'des-ede3-ecb' : 'des-ede3-cbc',
+      keyBuf: Buffer.concat([k8, k8, k8]),
+      ivLen: 8,
+    };
+  }
+  if (algBase === 'DESEDE' || algBase === '3DES') {
+    const k24 = Buffer.alloc(24);
+    rawKey.copy(k24, 0, 0, Math.min(24, rawKey.length));
+    if (rawKey.length > 8 && rawKey.length <= 16) {
+      rawKey.copy(k24, 16, 0, 8);
+    } else if (rawKey.length > 0 && rawKey.length <= 8) {
+      k24.copy(k24, 8, 0, 8);
+      k24.copy(k24, 16, 0, 8);
+    }
+    return {
+      alg: blockMode === 'ECB' ? 'des-ede3-ecb' : 'des-ede3-cbc',
+      keyBuf: k24,
+      ivLen: 8,
+    };
+  }
+  const bits = rawKey.length <= 16 ? 128 : rawKey.length <= 24 ? 192 : 256;
+  const targetLen = bits / 8;
+  const kAes = rawKey.length === targetLen ? rawKey : (() => {
+    const b = Buffer.alloc(targetLen);
+    rawKey.copy(b, 0, 0, Math.min(targetLen, rawKey.length));
+    return b;
+  })();
+  return {
+    alg: blockMode === 'ECB' ? `aes-${bits}-ecb` : `aes-${bits}-${blockMode.toLowerCase()}`,
+    keyBuf: kAes,
+    ivLen: 16,
+  };
+}
+
 function buildRhinoShim() {
   function SecretKeySpec(keyBytes, alg) {
     return { key: toNodeBytes(keyBytes), alg: String(alg || 'AES') };
   }
+  function DESKeySpec(keyBytes) {
+    return { key: toNodeBytes(keyBytes).subarray(0, 8), alg: 'DES' };
+  }
+  function DESedeKeySpec(keyBytes) {
+    return { key: toNodeBytes(keyBytes).subarray(0, 24), alg: 'DESede' };
+  }
   function IvParameterSpec(ivBytes) {
     return { iv: toNodeBytes(ivBytes) };
   }
+  const SecretKeyFactory = {
+    getInstance(alg) {
+      return {
+        generateSecret(spec) {
+          return spec?.key ? spec : { key: toNodeBytes(spec), alg: String(alg || 'DES') };
+        },
+      };
+    },
+  };
   const Cipher = {
     ENCRYPT_MODE: 1,
     DECRYPT_MODE: 2,
     getInstance(transformation) {
       let mode = 2;
-      let keyBuf = Buffer.alloc(16);
+      let rawKey = Buffer.alloc(16);
       let ivBuf = null;
       const parts = String(transformation || 'AES/CBC/PKCS5Padding').split('/');
       const algBase = parts[0].toUpperCase();
@@ -76,22 +135,17 @@ function buildRhinoShim() {
       return {
         init(opmode, keySpec, ivSpec) {
           mode = Number(opmode);
-          keyBuf = keySpec?.key ? toNodeBytes(keySpec.key) : toNodeBytes(keySpec);
+          rawKey = keySpec?.key ? toNodeBytes(keySpec.key) : toNodeBytes(keySpec);
           if (blockMode !== 'ECB') {
-            ivBuf = ivSpec?.iv ? toNodeBytes(ivSpec.iv) : (ivSpec ? toNodeBytes(ivSpec) : Buffer.alloc(algBase.startsWith('DES') ? 8 : 16));
+            const ivLen = algBase.startsWith('DES') ? 8 : 16;
+            const rawIv = ivSpec?.iv ? toNodeBytes(ivSpec.iv) : (ivSpec ? toNodeBytes(ivSpec) : Buffer.alloc(ivLen));
+            ivBuf = Buffer.alloc(ivLen);
+            rawIv.copy(ivBuf, 0, 0, Math.min(ivLen, rawIv.length));
           }
         },
         doFinal(data) {
           const buf = toNodeBytes(data);
-          let alg = 'aes-128-cbc';
-          if (algBase === 'AES') {
-            const bits = keyBuf.length <= 16 ? 128 : keyBuf.length <= 24 ? 192 : 256;
-            alg = blockMode === 'ECB' ? `aes-${bits}-ecb` : `aes-${bits}-${blockMode.toLowerCase()}`;
-          } else if (algBase === 'DES') {
-            alg = blockMode === 'ECB' ? 'des-ecb' : 'des-cbc';
-          } else if (algBase === 'DESEDE' || algBase === '3DES') {
-            alg = blockMode === 'ECB' ? 'des-ede3-ecb' : 'des-ede3-cbc';
-          }
+          const { alg, keyBuf } = normalizeDesKeyAndAlg(algBase, blockMode, rawKey);
           const fn = mode === 1 ? crypto.createCipheriv : crypto.createDecipheriv;
           const c = fn(alg, keyBuf, blockMode === 'ECB' ? null : ivBuf);
           if (padding === 'NOPADDING') c.setAutoPadding(false);
@@ -132,17 +186,24 @@ function buildRhinoShim() {
       };
     },
   };
+  function JString(v, cs) {
+    let str;
+    if (Buffer.isBuffer(v) || v instanceof Uint8Array || Array.isArray(v)) {
+      const b = toNodeBytes(v);
+      const enc = cs ? String(cs).toLowerCase() : 'utf-8';
+      str = enc !== 'utf-8' && enc !== 'utf8' && iconv.encodingExists(enc) ? iconv.decode(b, enc) : b.toString('utf8');
+    } else {
+      str = String(v ?? '');
+    }
+    return new.target ? new globalThis.String(str) : str;
+  }
+  Object.setPrototypeOf(JString, globalThis.String);
+  JString.prototype = globalThis.String.prototype;
+
   const Packages = {
     java: {
       lang: {
-        String: function JString(v, cs) {
-          if (Buffer.isBuffer(v) || v instanceof Uint8Array || Array.isArray(v)) {
-            const b = toNodeBytes(v);
-            const enc = cs ? String(cs).toLowerCase() : 'utf-8';
-            return enc !== 'utf-8' && enc !== 'utf8' && iconv.encodingExists(enc) ? iconv.decode(b, enc) : b.toString('utf8');
-          }
-          return String(v ?? '');
-        },
+        String: JString,
       },
       util: { Base64, Arrays },
       security: { MessageDigest },
@@ -150,7 +211,8 @@ function buildRhinoShim() {
     javax: {
       crypto: {
         Cipher,
-        spec: { SecretKeySpec, IvParameterSpec },
+        SecretKeyFactory,
+        spec: { SecretKeySpec, DESKeySpec, DESedeKeySpec, IvParameterSpec },
       },
     },
     android: {
@@ -162,7 +224,7 @@ function buildRhinoShim() {
     const addPkg = (p) => {
       if (p && typeof p === 'object') {
         for (const [k, v] of Object.entries(p)) {
-          if (k !== 'String') scope[k] = v;
+          scope[k] = v;
         }
       }
     };
@@ -337,21 +399,13 @@ function createSymmetricCrypto(transformation, key, iv) {
   const parts = String(transformation || 'AES/CBC/PKCS5Padding').split('/');
   const algBase = parts[0].toUpperCase();
   const mode = (parts[1] || 'CBC').toUpperCase();
-  const keyBuf = Buffer.isBuffer(key) ? key : Buffer.from(String(key ?? ''), 'utf8');
-  const ivBuf = iv !== undefined && iv !== null
+  const rawKey = Buffer.isBuffer(key) ? key : Buffer.from(String(key ?? ''), 'utf8');
+  const { alg, keyBuf, ivLen } = normalizeDesKeyAndAlg(algBase, mode, rawKey);
+  const rawIv = iv !== undefined && iv !== null
     ? (Buffer.isBuffer(iv) ? iv : Buffer.from(String(iv), 'utf8'))
-    : Buffer.alloc(algBase === 'DES' || algBase === 'DESEDE' ? 8 : 16);
-
-  let alg = 'aes-128-cbc';
-  if (algBase === 'AES') {
-    const bits = keyBuf.length <= 16 ? 128 : keyBuf.length <= 24 ? 192 : 256;
-    alg = mode === 'ECB' ? `aes-${bits}-ecb` : `aes-${bits}-${mode.toLowerCase()}`;
-  } else if (algBase === 'DES') {
-    alg = mode === 'ECB' ? 'des-ecb' : 'des-cbc';
-  } else if (algBase === 'DESEDE' || algBase === '3DES') {
-    alg = mode === 'ECB' ? 'des-ede3-ecb' : 'des-ede3-cbc';
-  }
-
+    : Buffer.alloc(ivLen);
+  const ivBuf = Buffer.alloc(ivLen);
+  rawIv.copy(ivBuf, 0, 0, Math.min(ivLen, rawIv.length));
   const effectiveIv = mode === 'ECB' ? null : ivBuf;
 
   return {
@@ -637,6 +691,25 @@ function getFragmentTopElements($) {
   return rootChildren.length > 0 ? rootChildren : [$.root()[0]];
 }
 
+function fixCssAttrQuotes(selector) {
+  return String(selector).replace(/\[([a-zA-Z-]+)\s*=\s*([^\]"'<>]+?)\s*\]/g, (m, name, raw) => {
+    if (!/[ ;]/.test(raw)) return m;
+    return `[${name}="${raw.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"]`;
+  });
+}
+
+function cssSelectSafe($, root, selector) {
+  let els = [];
+  try { els = $(root).find(selector).toArray(); } catch { els = []; }
+  if (els.length === 0) {
+    const fixed = fixCssAttrQuotes(selector);
+    if (fixed !== selector) {
+      try { els = $(root).find(fixed).toArray(); } catch { /* keep empty */ }
+    }
+  }
+  return els;
+}
+
 function evalCssRule(content, ruleStr, returnElements = false) {
   const html = typeof content === 'string' ? content : (content?.outerHtml ? content.outerHtml() : String(content ?? ''));
   const $ = cheerio.load(html);
@@ -651,7 +724,7 @@ function evalCssRule(content, ruleStr, returnElements = false) {
       sel = rest.slice(0, lastAt).trim();
       attr = rest.slice(lastAt + 1).trim();
     }
-    const els = $(sel).toArray();
+    const els = cssSelectSafe($, $.root()[0], sel);
     if (returnElements) return els.map((el) => $.html(el));
     return extractFromCheerio($, els, attr || 'text');
   }
@@ -758,20 +831,31 @@ function evalCssRule(content, ruleStr, returnElements = false) {
     const next = [];
     for (const el of current) {
       try {
-        let found = $(el).find(selector).toArray();
-        if (found.length === 0 && $(el).is(selector)) {
-          found = [el];
+        let found = cssSelectSafe($, el, selector);
+        if (found.length === 0) {
+          try { if ($(el).is(selector)) found = [el]; } catch { /* ignore */ }
         }
         if (textFilter !== null) {
           const candidates = found.filter((n) => !['html', 'head', 'body', 'script', 'style', 'noscript'].includes(n.tagName));
-          const ownMatches = candidates.filter((n) =>
-            $(n).contents().filter((_, c) => c.type === 'text').text().includes(textFilter),
-          );
-          found = ownMatches.length > 0
-            ? ownMatches
-            : candidates.filter(
-                (n) => $(n).text().includes(textFilter) && $(n).children().toArray().every((ch) => !$(ch).text().includes(textFilter)),
-              );
+          const target = String(textFilter).trim();
+          const targetTight = target.replace(/\s+/g, '');
+          const rank = (n) => {
+            const own = $(n).contents().filter((_, c) => c.type === 'text').text();
+            const all = $(n).text();
+            const tests = [
+              (t) => t.trim() === target,
+              (t) => t.replace(/\s+/g, '') === targetTight,
+              (t) => t.trim().startsWith(target),
+              (t) => t.includes(target),
+            ];
+            for (let i = 0; i < tests.length; i++) if (tests[i](own) || tests[i](all)) return i;
+            return 99;
+          };
+          const scored = candidates
+            .map((n) => ({ n, r: rank(n), len: $(n).text().trim().length }))
+            .filter((x) => x.r < 99);
+          scored.sort((a, b) => a.r - b.r || a.len - b.len);
+          found = scored.map((x) => x.n);
         }
         next.push(...found);
       } catch {
@@ -816,7 +900,16 @@ function evalXPathRule(content, ruleStr, returnElements = false) {
       .replace(/<!DOCTYPE[^>]*>/gi, '')
       .replace(/\s+xmlns=["'][^"']*["']/gi, '');
     const doc = new DOMParser({ onError: () => {} }).parseFromString(xhtml, 'text/xml');
-    const nodes = xpath.select(expr, doc);
+    let nodes = xpath.select(expr, doc);
+    if (Array.isArray(nodes) && nodes.length === 0) {
+      // Some pages nest the predicate element deeper, or add whitespace around text().
+      const alt = expr
+        .replace(/\[([a-zA-Z][\w:-]*)\]/g, (m, tag) => `[.//${tag}]`)
+        .replace(/text\(\)\s*=\s*("([^"]*)"|'([^']*)')/g, (m, _q, a, b) => `text()[normalize-space(.)=${JSON.stringify(a ?? b)}]`);
+      if (alt !== expr) {
+        try { nodes = xpath.select(alt, doc); } catch { /* keep empty result */ }
+      }
+    }
     if (!Array.isArray(nodes)) return nodes !== undefined && nodes !== null ? [String(nodes)] : [];
     return nodes.map((n) => {
       if (returnElements) return n.toString();

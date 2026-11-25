@@ -2,8 +2,24 @@ import iconv from 'iconv-lite';
 import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 
-export const DEFAULT_UA =
+export const MOBILE_UA =
   'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
+export const DESKTOP_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+export const DEFAULT_UA = MOBILE_UA;
+
+export function isMobileHostUrl(urlStr) {
+  try {
+    const h = new URL(String(urlStr ?? '').replace(/,\s*\{[\s\S]*\}\s*$/, '').trim()).hostname.toLowerCase();
+    return /^(m|wap|w\d+|h5|mobile)\./.test(h);
+  } catch {
+    return false;
+  }
+}
+
+export function defaultUaForUrl() {
+  return MOBILE_UA;
+}
 
 // ---------------------------------------------------------------------------
 // Cookie jar
@@ -269,10 +285,58 @@ export function resolveUrl(baseUrl, target) {
       return `https:${trimmed}`;
     }
   }
+  if (cleanBase && !/^https?:\/\//i.test(cleanBase)) {
+    throw new Error(`无法解析相对 URL：书源地址不是有效的 http(s) 地址（${cleanBase}）`);
+  }
   try {
     return new URL(trimmed, cleanBase).href;
   } catch {
     return trimmed;
+  }
+}
+
+const RESTRICTED_HEADERS = new Set(['keep-alive', 'connection', 'host', 'content-length', 'transfer-encoding', 'upgrade', 'proxy-connection']);
+const DROP_WHEN_EMPTY_HEADERS = new Set([
+  'referer',
+  'user-agent',
+  'cookie',
+  'origin',
+  'accept',
+  'accept-encoding',
+  'accept-language',
+  'if-modified-since',
+  'if-none-match',
+  'range',
+]);
+
+/**
+ * Drop transport-restricted headers and empty standard browser headers, while keeping
+ * custom empty headers (e.g. Qimao signs `'AUTHORIZATION': ''`, `'qm-params': ''`).
+ */
+export function sanitizeHeaders(input) {
+  const out = {};
+  const seenLower = new Map();
+  for (const [key, value] of Object.entries(input || {})) {
+    if (value === undefined || value === null) continue;
+    const str = String(value);
+    const lower = key.toLowerCase();
+    if (RESTRICTED_HEADERS.has(lower)) continue;
+    if (!str.trim() && DROP_WHEN_EMPTY_HEADERS.has(lower)) continue;
+    if (seenLower.has(lower)) delete out[seenLower.get(lower)];
+    seenLower.set(lower, key);
+    out[key] = str;
+  }
+  return out;
+}
+
+function assignHeadersCaseInsensitive(target, src) {
+  if (!src || typeof src !== 'object') return;
+  for (const [k, v] of Object.entries(src)) {
+    const lower = k.toLowerCase();
+    for (const existing of Object.keys(target)) {
+      if (existing.toLowerCase() === lower && existing !== k) delete target[existing];
+    }
+    target[k] = v;
   }
 }
 
@@ -305,13 +369,13 @@ export function parseLegadoUrl(rawUrl, baseUrl = '', sourceHeader = '') {
   }
 
   const finalUrl = resolveUrl(baseUrl, urlPart);
-  const headers = { 'User-Agent': DEFAULT_UA };
+  const headers = { 'User-Agent': defaultUaForUrl(finalUrl || baseUrl) };
 
   // Merge source-level headers
   if (sourceHeader && typeof sourceHeader === 'string' && sourceHeader.trim().startsWith('{')) {
     try {
       const parsed = JSON.parse(sourceHeader.replace(/'/g, '"'));
-      Object.assign(headers, parsed);
+      assignHeadersCaseInsensitive(headers, parsed);
     } catch {
       // ignore invalid source header
     }
@@ -321,12 +385,12 @@ export function parseLegadoUrl(rawUrl, baseUrl = '', sourceHeader = '') {
   if (opts.headers) {
     if (typeof opts.headers === 'string') {
       try {
-        Object.assign(headers, JSON.parse(opts.headers.replace(/'/g, '"')));
+        assignHeadersCaseInsensitive(headers, JSON.parse(opts.headers.replace(/'/g, '"')));
       } catch {
         // ignore
       }
     } else if (typeof opts.headers === 'object') {
-      Object.assign(headers, opts.headers);
+      assignHeadersCaseInsensitive(headers, opts.headers);
     }
   }
 
@@ -440,7 +504,7 @@ async function fetchLegadoOnce(rawUrl, options = {}) {
     throw new Error(`Invalid URL: ${parsed.url}`);
   }
 
-  const headers = { ...parsed.headers, ...(extraHeaders || {}) };
+  const headers = sanitizeHeaders({ ...parsed.headers, ...(extraHeaders || {}) });
   const existingCookie = cookieHeader !== undefined ? cookieHeader : getCookieForUrl(parsed.url);
   if (existingCookie && !hasHeader(headers, 'cookie')) {
     headers.Cookie = existingCookie;

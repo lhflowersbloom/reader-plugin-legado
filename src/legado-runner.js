@@ -1,7 +1,33 @@
 import { createHash } from 'node:crypto';
 import * as cheerio from 'cheerio';
-import { fetchLegado, encodeQueryParam, parseLegadoUrl, resolveUrl } from './http.js';
+import { fetchLegado, encodeQueryParam, parseLegadoUrl, resolveUrl, MOBILE_UA, DESKTOP_UA, defaultUaForUrl } from './http.js';
 import { RuleContext, htmlToCleanText, resolveSourceHeader } from './engine.js';
+
+export function hasLoginUrl(source) {
+  const raw = String(source?.loginUrl ?? '').trim();
+  if (raw && raw !== 'null' && raw !== 'undefined') {
+    if (raw.startsWith('{')) {
+      try {
+        const obj = JSON.parse(raw);
+        const u = String(obj?.url ?? '').trim();
+        if (u && u !== 'null') return true;
+      } catch {
+        // ignore invalid loginUrl JSON
+      }
+    } else if (/^https?:\/\//i.test(raw)) {
+      return true;
+    }
+  }
+  return Array.isArray(source?.loginUi) && source.loginUi.length > 0;
+}
+
+export function ruleNeedsWebView(rawUrl, rule) {
+  if (rule && String(rule.webJs ?? '').trim()) return true;
+  const s = String(rawUrl ?? '');
+  const m = /,\s*(\{[\s\S]*\})\s*$/.exec(s);
+  if (!m) return false;
+  return /["']?webView["']?\s*:\s*(?:true|["']true["']|1)\b/i.test(m[1]);
+}
 
 function shortHash(input) {
   return createHash('sha256').update(String(input)).digest('hex').slice(0, 16);
@@ -163,9 +189,9 @@ function assertLegadoResponse(res, stage = 'search') {
 // ---------------------------------------------------------------------------
 // Book lists (search + explore share the same parser)
 // ---------------------------------------------------------------------------
-function buildSearchUrl(source, query, page = 1) {
+function buildSearchRequest(source, query, page = 1) {
   const raw = String(source.searchUrl || '').trim();
-  if (!raw) return '';
+  if (!raw) return { url: '', vars: {} };
   const baseUrl = String(source.bookSourceUrl || '').trim();
 
   const ctx = new RuleContext({
@@ -177,7 +203,7 @@ function buildSearchUrl(source, query, page = 1) {
   });
 
   if (raw.startsWith('@js:') || raw.includes('<js>')) {
-    return ctx.getString(raw);
+    return { url: ctx.getString(raw), vars: { ...ctx.vars } };
   }
 
   // Detect charset in trailing ,{...} option
@@ -185,10 +211,10 @@ function buildSearchUrl(source, query, page = 1) {
   const encodedKey = encodeQueryParam(query, parsed.charset);
 
   // Replace {{key}} and {{page}}
-  return ctx.interpolateTemplate(raw, { encodedKey });
+  return { url: ctx.interpolateTemplate(raw, { encodedKey }), vars: { ...ctx.vars } };
 }
 
-function parseBookList(source, res, rule, { key = '', page = 1 } = {}) {
+function parseBookList(source, res, rule, { key = '', page = 1, initialVars = {} } = {}) {
   const baseUrl = res.url || String(source.bookSourceUrl || '').trim();
   const ctx = new RuleContext({
     source,
@@ -196,6 +222,7 @@ function parseBookList(source, res, rule, { key = '', page = 1 } = {}) {
     content: res.body,
     key,
     page,
+    vars: { ...initialVars },
   });
 
   // Optional init rule (keep object/HTML intact, do not stringify!)
@@ -254,19 +281,52 @@ function parseBookList(source, res, rule, { key = '', page = 1 } = {}) {
   return results;
 }
 
-export async function searchWithSource(source, query, { page = 1, timeoutMs = 8000, signal } = {}) {
-  const searchUrl = buildSearchUrl(source, query, page);
+export async function searchWithSource(source, query, { page = 1, timeoutMs = 8000, signal, extraHeaders, noUaRetry = false } = {}) {
+  const { url: searchUrl, vars: searchVars } = buildSearchRequest(source, query, page);
   if (!searchUrl) return [];
 
+  const sourceHeader = resolveSourceHeader(source);
   const res = await fetchLegado(searchUrl, {
     baseUrl: String(source.bookSourceUrl || '').trim(),
-    sourceHeader: resolveSourceHeader(source),
+    sourceHeader,
     timeoutMs,
     signal,
+    extraHeaders,
   });
   assertLegadoResponse(res, 'search');
 
-  return parseBookList(source, res, source.ruleSearch || {}, { key: query, page });
+  const list = parseBookList(source, res, source.ruleSearch || {}, { key: query, page, initialVars: searchVars });
+  // If a PC source redirected mobile UA to an m./w. mobile page where PC search rules matched 0 items, retry once with desktop UA.
+  if (
+    list.length === 0 &&
+    !noUaRetry &&
+    !extraHeaders &&
+    !/user-agent/i.test(sourceHeader)
+  ) {
+    let redirectedToMobile = false;
+    try {
+      const reqUrl = parseLegadoUrl(searchUrl, String(source.bookSourceUrl || '').trim(), '').url;
+      const reqHost = new URL(reqUrl).hostname.toLowerCase();
+      const resHost = new URL(res.url || reqUrl).hostname.toLowerCase();
+      redirectedToMobile = !/^(m|wap|w\d+|h5)\./.test(reqHost) && /^(m|wap|w\d+|h5)\./.test(resHost);
+    } catch {
+      redirectedToMobile = false;
+    }
+    if (redirectedToMobile) {
+      try {
+        return await searchWithSource(source, query, {
+          page,
+          timeoutMs,
+          signal,
+          extraHeaders: { 'User-Agent': DESKTOP_UA },
+          noUaRetry: true,
+        });
+      } catch {
+        return list;
+      }
+    }
+  }
+  return list;
 }
 
 // ---------------------------------------------------------------------------
@@ -401,7 +461,7 @@ function takeBatch(queue, visited, max) {
   return batch;
 }
 
-export async function fetchBookDetail(source, meta, { timeoutMs = 10_000, signal } = {}) {
+export async function fetchBookDetail(source, meta, { timeoutMs = 10_000, signal, extraHeaders, skipRemember = false } = {}) {
   const bookUrl = meta.bookUrl;
   const infoRule = source.ruleBookInfo || {};
 
@@ -416,8 +476,8 @@ export async function fetchBookDetail(source, meta, { timeoutMs = 10_000, signal
 
   if (bookUrl && Object.keys(infoRule).length > 0) {
     try {
-      const res = await fetchLegado(bookUrl, requestOptions(source, { timeoutMs, signal, retries: 1 }));
-      rememberPage(source, bookUrl, res);
+      const res = await fetchLegado(bookUrl, requestOptions(source, { timeoutMs, signal, retries: 1, extraHeaders }));
+      if (!skipRemember) rememberPage(source, bookUrl, res);
 
       const ctx = new RuleContext({
         source,
@@ -479,14 +539,54 @@ export async function fetchBookDetail(source, meta, { timeoutMs = 10_000, signal
  * chain) or several (fetched concurrently), as in Legado.
  * Returns { manifest, truncated }.
  */
-async function buildChapterManifest(source, meta, publicationRef, { timeoutMs = 12_000, signal, maxTocPages = 100 } = {}) {
+async function findTocFallbackUrl(source, bookUrl, { timeoutMs, signal, extraHeaders } = {}) {
+  if (!bookUrl) return '';
+  let res;
+  try {
+    res = await fetchLegado(bookUrl, requestOptions(source, { timeoutMs, signal, retries: 1, extraHeaders }));
+  } catch {
+    return '';
+  }
+  const body = String(res?.body || '');
+  if (!body) return '';
+  const anchors = [];
+  const re = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(body))) {
+    const text = m[2].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+    if (text) anchors.push({ href: m[1], text });
+  }
+  const priorities = ['章节目录', '查看目录', '开始阅读', '目录'];
+  let best = null;
+  let bestRank = 99;
+  for (const a of anchors) {
+    const i = priorities.indexOf(a.text);
+    if (i >= 0 && i < bestRank) { best = a; bestRank = i; }
+  }
+  if (!best) {
+    for (const a of anchors) {
+      for (let i = 0; i < priorities.length; i++) {
+        if (a.text.includes(priorities[i]) && i < bestRank) { best = a; bestRank = i; }
+      }
+    }
+  }
+  if (!best) return '';
+  try { return resolveUrl(res.url || bookUrl, best.href); } catch { return ''; }
+}
+
+async function buildChapterManifest(
+  source,
+  meta,
+  publicationRef,
+  { timeoutMs = 12_000, signal, maxTocPages = 100, noFallback = false, noUaRetry = false, extraHeaders, skipPageCache = false } = {},
+) {
   const tocRule = source.ruleToc || {};
   let startUrl = meta.tocUrl || meta.bookUrl;
   let effectiveMeta = meta;
 
   // If tocUrl wasn't resolved yet and ruleBookInfo exists, fetch detail first so book.kind / vars / tocUrl are ready
   if (!meta.tocUrl && (source.ruleBookInfo?.tocUrl || source.ruleBookInfo?.kind || source.ruleBookInfo?.name)) {
-    const detailed = await fetchBookDetail(source, meta, { timeoutMs, signal });
+    const detailed = await fetchBookDetail(source, meta, { timeoutMs, signal, extraHeaders, skipRemember: skipPageCache });
     effectiveMeta = detailed.meta;
     startUrl = detailed.meta.tocUrl || meta.bookUrl;
   }
@@ -501,6 +601,7 @@ async function buildChapterManifest(source, meta, publicationRef, { timeoutMs = 
 
   const contentRuleStr = JSON.stringify(source.ruleContent || '');
   const contentNeedsVars = /java\.get\s*\(|@get:\{|getVariable\s*\(/i.test(contentRuleStr);
+  const contentNeedsTotalChapters = /totalChapterNum/.test(contentRuleStr);
   let sharedVars = null;
   if (contentNeedsVars && effectiveMeta.vars && Object.keys(effectiveMeta.vars).length > 0) {
     const picked = {};
@@ -514,18 +615,19 @@ async function buildChapterManifest(source, meta, publicationRef, { timeoutMs = 
   let pages = 0;
   let truncated = false;
   let firstBatch = true;
+  let firstResUrl = '';
 
   while (queue.length > 0 && pages < maxPages) {
     const batch = takeBatch(queue, visitedPages, Math.min(PAGE_FETCH_CONCURRENCY, maxPages - pages));
     if (batch.length === 0) continue;
     pages += batch.length;
-    const cachedFirst = firstBatch ? recallPage(source, batch[0]) : null;
+    const cachedFirst = firstBatch && !skipPageCache ? recallPage(source, batch[0]) : null;
     firstBatch = false;
     const settled = await Promise.allSettled(
       batch.map((u, i) =>
         i === 0 && cachedFirst
           ? Promise.resolve(cachedFirst)
-          : fetchLegado(u, requestOptions(source, { timeoutMs, signal, retries: 1 })),
+          : fetchLegado(u, requestOptions(source, { timeoutMs, signal, retries: 1, extraHeaders })),
       ),
     );
 
@@ -536,6 +638,7 @@ async function buildChapterManifest(source, meta, publicationRef, { timeoutMs = 
         if (settled[b].status === 'rejected') throw settled[b].reason;
         res = settled[b].value;
         assertLegadoResponse(res, 'toc');
+        if (!firstResUrl) firstResUrl = res.url || pageUrl;
       } catch (err) {
         // The first page must work; a failing later page only truncates the TOC.
         if (signal?.aborted || chapters.length === 0) throw err;
@@ -610,6 +713,77 @@ async function buildChapterManifest(source, meta, publicationRef, { timeoutMs = 
   }
   if (queue.some((u) => u && !visitedPages.has(u))) truncated = true;
 
+  // Only AFTER parsing yields 0 chapters: retry once from meta.bookUrl with the opposite User-Agent
+  // (e.g. sites like 黑岩 / 若初 / 塔读 redirect mobile UA to w./m. pages where PC TOC rules return 0 chapters).
+  if (chapters.length === 0 && !noUaRetry && !/user-agent/i.test( resolveSourceHeader(source) )) {
+    const usedUa = defaultUaForUrl(startUrl || meta.bookUrl);
+    const altUa = usedUa === DESKTOP_UA ? MOBILE_UA : DESKTOP_UA;
+    let shouldRetryUa = usedUa !== DESKTOP_UA;
+    if (!shouldRetryUa) {
+      try {
+        shouldRetryUa = /^(w\d*|m|wap|h5)\./i.test(new URL(firstResUrl || startUrl).hostname);
+      } catch {
+        shouldRetryUa = false;
+      }
+    }
+    if (shouldRetryUa && (meta.bookUrl || startUrl)) {
+      try {
+        let retryBookUrl = meta.bookUrl || startUrl;
+        // If search on a declared www.* source returned an m.*/w.* bookUrl due to mobile UA, restore the source's declared www.* host for the desktop retry.
+        try {
+          const srcHost = new URL(String(source.bookSourceUrl || '').replace(/#[\s\S]*$/, '').trim()).hostname;
+          const bUrl = new URL(retryBookUrl);
+          if (/^www\./i.test(srcHost) && /^(w\d*|m|wap)\./i.test(bUrl.hostname) && bUrl.hostname.replace(/^(w\d*|m|wap)\./i, '') === srcHost.slice(4)) {
+            bUrl.hostname = srcHost;
+            retryBookUrl = bUrl.href;
+          }
+        } catch {
+          // keep retryBookUrl as-is
+        }
+        const cleanMeta = meta.bookUrl ? { ...meta, bookUrl: retryBookUrl, tocUrl: '' } : { ...effectiveMeta, tocUrl: retryBookUrl };
+        const retriedUa = await buildChapterManifest(source, cleanMeta, publicationRef, {
+          timeoutMs,
+          signal,
+          maxTocPages,
+          noUaRetry: true,
+          extraHeaders: { 'User-Agent': altUa },
+          skipPageCache: true,
+        });
+        if (retriedUa.manifest.items.length > 0) return retriedUa;
+      } catch {
+        // UA retry is best-effort only
+      }
+    }
+  }
+
+  if (chapters.length === 0 && !noFallback) {
+    try {
+      const fallbackUrl = await findTocFallbackUrl(source, effectiveMeta.bookUrl || meta.bookUrl, { timeoutMs, signal, extraHeaders });
+      if (fallbackUrl && fallbackUrl !== startUrl) {
+        const retried = await buildChapterManifest(
+          source,
+          { ...effectiveMeta, tocUrl: fallbackUrl },
+          publicationRef,
+          { timeoutMs, signal, maxTocPages, noFallback: true, noUaRetry: true, extraHeaders, skipPageCache: true },
+        );
+        if (retried.manifest.items.length > 0) return retried;
+      }
+    } catch {
+      // fallback is best-effort only
+    }
+  }
+
+  if (contentNeedsTotalChapters && chapters.length > 0) {
+    const total = chapters.length;
+    for (const item of chapters) {
+      const dec = decodeRef(item.ref);
+      if (dec) {
+        dec.n = total;
+        item.ref = encodeRef(dec);
+      }
+    }
+  }
+
   const manifest = {
     publicationRef,
     sourceName: source.bookSourceName || source.bookSourceUrl,
@@ -681,10 +855,20 @@ function normalizeTextBlocks(text) {
  * asHtml=true  -> { mediaType: 'text/html', text: html with reader-res images }
  * nextContentUrl may return one URL (chain) or several (fetched concurrently).
  */
+function decorateContentFailure(source, chapterUrl, contentRule, baseMessage) {
+  if (ruleNeedsWebView(chapterUrl, contentRule)) {
+    return new Error('该章节需要 WebView 渲染，插件不支持');
+  }
+  if (hasLoginUrl(source) && !/需要登录/.test(baseMessage)) {
+    return new Error(`${baseMessage}（此书源需要登录）`);
+  }
+  return null;
+}
+
 export async function fetchChapterContent(
   source,
   chapterUrl,
-  { timeoutMs = 12_000, signal, asHtml = false, vars = {}, chapter = null, maxPages = 30 } = {},
+  { timeoutMs = 12_000, signal, asHtml = false, vars = {}, chapter = null, totalChapterNum = 0, maxPages = 30 } = {},
 ) {
   const contentRule = source.ruleContent || {};
   const visited = new Set();
@@ -693,6 +877,7 @@ export async function fetchChapterContent(
   const rawParts = [];
   const limit = Math.max(1, Math.min(100, Number(maxPages) || 30));
   const chapterInfo = { url: chapterUrl, title: chapter?.title || '', index: chapter?.index ?? 0 };
+  const bookInfo = totalChapterNum > 0 ? { totalChapterNum } : {};
   let lastCtx = null;
   let pages = 0;
 
@@ -713,7 +898,10 @@ export async function fetchChapterContent(
         assertLegadoResponse(res, 'content');
       } catch (err) {
         // The first page must work; a failing later page only shortens the chapter.
-        if (signal?.aborted || (parts.length === 0 && rawParts.length === 0)) throw err;
+        if (signal?.aborted) throw err;
+        if (parts.length === 0 && rawParts.length === 0) {
+          throw decorateContentFailure(source, chapterUrl, contentRule, String(err?.message || err)) || err;
+        }
         continue;
       }
 
@@ -722,6 +910,7 @@ export async function fetchChapterContent(
         baseUrl: res.url || pageUrl,
         content: res.body,
         vars,
+        book: bookInfo,
         chapter: chapterInfo,
       });
       lastCtx = ctx;
@@ -746,10 +935,12 @@ export async function fetchChapterContent(
 
   if (asHtml) {
     const { html } = buildRichHtml(rawParts, source);
-    return {
-      mediaType: 'text/html',
-      text: html.trim() ? html : '<p>（本章正文为空或解析失败）</p>',
-    };
+    if (!html.trim()) {
+      const hint = decorateContentFailure(source, chapterUrl, contentRule, '本章正文为空');
+      if (hint) throw hint;
+      return { mediaType: 'text/html', text: '<p>（本章正文为空或解析失败）</p>' };
+    }
+    return { mediaType: 'text/html', text: html };
   }
 
   // Like Legado, replaceRegex runs on the formatted text of the whole chapter.
@@ -757,10 +948,12 @@ export async function fetchChapterContent(
   if (text && contentRule.replaceRegex) {
     text = normalizeTextBlocks(applyReplaceRegex(text, contentRule.replaceRegex, lastCtx));
   }
-  return {
-    mediaType: 'text/plain',
-    text: text || '（本章正文为空或解析失败）',
-  };
+  if (!text) {
+    const hint = decorateContentFailure(source, chapterUrl, contentRule, '本章正文为空');
+    if (hint) throw hint;
+    return { mediaType: 'text/plain', text: '（本章正文为空或解析失败）' };
+  }
+  return { mediaType: 'text/plain', text };
 }
 
 // ---------------------------------------------------------------------------
@@ -840,23 +1033,33 @@ async function testCandidate(source, candidate, { signal, stepTimeoutMs }) {
 
     stage = 'content';
     const asHtml = sourceUsesHtml(source);
+    let lastContentErr = null;
     const tryChapter = async (item, s) => {
       const ch = decodeRef(item.ref) || {};
-      const content = await fetchChapterContent(source, ch.c, {
-        timeoutMs: stepTimeoutMs,
-        signal: s,
-        asHtml,
-        vars: ch.v || detailed.meta.vars || {},
-        chapter: { title: item.title, index: item.seq },
-        maxPages: 3,
-      });
-      return chapterHasBody(content, asHtml);
+      try {
+        const content = await fetchChapterContent(source, ch.c, {
+          timeoutMs: stepTimeoutMs,
+          signal: s,
+          asHtml,
+          vars: ch.v || detailed.meta.vars || {},
+          chapter: { title: item.title, index: item.seq },
+          totalChapterNum: ch.n || manifest.items.length,
+          maxPages: 3,
+        });
+        return chapterHasBody(content, asHtml);
+      } catch (err) {
+        if (s?.aborted) throw err;
+        lastContentErr = err;
+        return false;
+      }
     };
     const hasBody = await withDeadline(
       async (s) => {
         if (await tryChapter(manifest.items[0], s)) return true;
         // The first entry is often a notice / “作品相关” page with almost no text.
-        return manifest.items.length > 1 ? tryChapter(manifest.items[1], s) : false;
+        if (manifest.items.length > 1 && (await tryChapter(manifest.items[1], s))) return true;
+        if (lastContentErr) throw lastContentErr;
+        return false;
       },
       stepTimeoutMs * 2,
       '正文',

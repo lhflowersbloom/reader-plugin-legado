@@ -430,7 +430,12 @@ async function handleReadResource(params, signal) {
     return fetchImageResource(source, decoded.i, decoded.r || '', { signal });
   }
   // The media type is fixed by the manifest (h flag), never by current settings.
-  return fetchChapterContent(source, decoded.c, { signal, asHtml: decoded.h === 1, vars: decoded.v || {} });
+  return fetchChapterContent(source, decoded.c, {
+    signal,
+    asHtml: decoded.h === 1,
+    vars: decoded.v || {},
+    totalChapterNum: decoded.n || 0,
+  });
 }
 
 // ---------------------------------------------------------------------------
